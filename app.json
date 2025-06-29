@@ -1,0 +1,61 @@
+{
+  "expo": {
+    "name": "AZIRM Collector",
+    "slug": "azirm",
+    "icon": "./icon.png",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "permissions": ["ACCESS_FINE_LOCATION"],
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.azirm.collector"
+    },
+    "android": {
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "CAMERA",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.FOREGROUND_SERVICE"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.azirm.collector",
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyDeL_EOOk94E_GgbBildMFFFbWs75b9BIw"
+        }
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow AZIRM Collector to access your camera to take photos of donation visits"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow AZIRM Collector to use your location to track your collection route",
+          "locationAlwaysPermission": "Allow AZIRM Collector to use your location for collecting route data"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2d2cfad6-b694-4cbd-a948-f00ed674991f"
+      }
+    },
+    "owner": "sbabouu"
+  }
+}
