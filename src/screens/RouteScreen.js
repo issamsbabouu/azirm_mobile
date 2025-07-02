@@ -72,16 +72,24 @@ const QuebecMapScreen = ({ navigation }) => {
     const { user, userName } = useAuth();
 
     const [collectorId, setCollectorId] = useState(null);
+    // When user logs in, fetch collectorId
     useEffect(() => {
         if (user?.id) {
             hasCenteredMapRef.current = false;
             fetchCollectorId();
-            fetchMissions();
             fetchUserProfile();
             requestLocationPermission();
         }
         return () => stopLocationTracking();
     }, [user]);
+
+// Once collectorId is available, fetch missions
+    useEffect(() => {
+        if (collectorId) {
+            fetchMissions();               // ✅ only run when collectorId is defined
+        }
+    }, [collectorId]);
+
     useEffect(() => {
         const interval = setInterval(() => {
             fetchTodaysCommissions();
@@ -104,11 +112,14 @@ const QuebecMapScreen = ({ navigation }) => {
         }
     };
     const fetchMissions = async () => {
+        if (!collectorId) return;
+
         setLoading(true);
         const { data, error } = await supabase
             .from('donor_addresses')
             .select('*')
-            .eq('bureau_id', user?.bureau_id);
+            .eq('collector_id', collectorId); // ✅ ici, on filtre par collector_id
+
         if (!error && data) setMissions(data);
         setLoading(false);
         fetchTodaysCommissions();
