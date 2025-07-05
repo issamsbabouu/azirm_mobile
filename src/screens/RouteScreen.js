@@ -1,28 +1,16 @@
 import React, { useEffect, useState, useRef } from 'react';
-import {
-    View,
-    Text,
-    Alert,
-    StyleSheet,
-    ActivityIndicator,
-    TouchableOpacity,
-    Dimensions,
-    Linking,
-    Modal,
-    Animated,
-    Image,
-    ScrollView,
-    TextInput,
-    SafeAreaView
-} from 'react-native';
+import {View, Text, Alert, StyleSheet, ActivityIndicator, TouchableOpacity, Dimensions, Linking, Modal, Animated, Image, ScrollView, TextInput, SafeAreaView, AppState} from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { supabase } from '../supabase';
 import { useAuth } from '../context/AuthContext';
 import { MaterialIcons, FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from "expo-linear-gradient";
-
+import AudioRecorderPlayer from 'react-native-audio-recorder-player';
+import RNFS from 'react-native-fs';
+import { PermissionsAndroid, Platform } from 'react-native';
 const { height: screenHeight } = Dimensions.get('window');
+
 function getDistanceFromLatLonInMeters(lat1, lon1, lat2, lon2) {
     const R = 6371000;
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -36,6 +24,9 @@ function getDistanceFromLatLonInMeters(lat1, lon1, lat2, lon2) {
 }
 
 const QuebecMapScreen = ({ navigation }) => {
+    const hasCenteredMapRef = useRef(false);
+    const lastLocationInsert = useRef(0);
+    const locationUpdateTimeout = useRef(null);
     const [isModalVisible, setModalVisible] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
     const [visitData, setVisitData] = useState({
@@ -45,7 +36,12 @@ const QuebecMapScreen = ({ navigation }) => {
         donationAmount: '',
         donationType: ''
     });
-    const [isNearAddress, setIsNearAddress] = useState(false);
+    const [statusCounts, setStatusCounts] = useState({
+        'non visité': 0,
+        'visité et accepté': 0,
+        'visité et refusé': 0,
+        'absent': 0
+    });
     const [todaysCommissions, setTodaysCommissions] = useState(0);
     const [missions, setMissions] = useState([]);
     const [filteredStatus, setFilteredStatus] = useState(null);
@@ -61,6 +57,10 @@ const QuebecMapScreen = ({ navigation }) => {
         donationAmount: '',
         donationType: 'Espèces'
     });
+    const audioRecorderPlayer = useRef(new AudioRecorderPlayer()).current;
+    const [isRecording, setIsRecording] = useState(false);
+    const [recordPath, setRecordPath] = useState('');
+    const [recordStartTime, setRecordStartTime] = useState(null);
     const [showRecordModal, setShowRecordModal] = useState(false);
     const [userProfileImage, setUserProfileImage] = useState('https://via.placeholder.com/150');
     const [walletBalance, setWalletBalance] = useState(0);
@@ -70,61 +70,149 @@ const QuebecMapScreen = ({ navigation }) => {
     const popupAnimation = useRef(new Animated.Value(0)).current;
     const mapRef = useRef(null);
     const { user, userName } = useAuth();
-
     const [collectorId, setCollectorId] = useState(null);
-    // When user logs in, fetch collectorId
+    const requestAudioPermission = async () => {
+        if (Platform.OS === 'android') {
+            const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+            return granted === PermissionsAndroid.RESULTS.GRANTED;
+        }
+        return true;
+    };
+
+    const fetchMissions = async () => {
+        setLoading(true);
+        try {
+            const { data: collectorData, error: collectorError } = await supabase
+                .from('collectors')
+                .select('id')
+                .eq('user_id', user.id)
+                .single();
+
+            if (collectorError || !collectorData) {
+                console.error("Erreur collector ID:", collectorError);
+                Alert.alert("Erreur", "Profil collecteur introuvable");
+                setLoading(false);
+                return;
+            }
+
+            setCollectorId(collectorData.id);
+
+            const { data, error } = await supabase
+                .from('donor_addresses')
+                .select(`
+                id,
+                address,
+                code_postal,
+                location_lat,
+                location_lng,
+                status,
+                updated_at,
+                collector_id
+            `)
+                .eq('collector_id', collectorData.id);
+
+            if (error) {
+                console.error("Erreur adresses:", error);
+                Alert.alert("Erreur", "Impossible de charger les adresses");
+                return;
+            }
+
+            const processed = data.map(addr => {
+                const lat = parseFloat(addr.adjusted_lat ?? addr.location_lat);
+                const lng = parseFloat(addr.adjusted_lng ?? addr.location_lng);
+
+                if (
+                    isNaN(lat) || isNaN(lng) ||
+                    lat < -90 || lat > 90 ||
+                    lng < -180 || lng > 180
+                ) {
+                    console.warn(`❌ Coordonnées invalides ou hors limite pour: ${addr.address} → (${lat}, ${lng})`);
+                    return null;
+                }
+
+                console.log(`✅ Adresse OK: ${addr.address} → https://www.google.com/maps?q=${lat},${lng}`);
+
+                return {
+                    ...addr,
+                    location_lat: lat,
+                    location_lng: lng,
+                    address: addr.address,
+                    postal_code: addr.code_postal,
+                    status: addr.status || 'non visité',
+                };
+            }).filter(addr => addr !== null);
+
+            console.log("Missions traitées:", processed); // Vérifier les données traitées
+
+            setMissions(processed);
+
+            // Calculer les compteurs de statut
+            const counts = {
+                'non visité': 0,
+                'visité et accepté': 0,
+                'visité et refusé': 0,
+                'absent': 0
+            };
+
+            processed.forEach(addr => {
+                const status = addr.status || 'non visité';
+                counts[status] = (counts[status] || 0) + 1;
+            });
+
+            setStatusCounts(counts);
+
+        } catch (err) {
+            console.error('Erreur fetchMissions:', err);
+            Alert.alert("Erreur", "Problème de chargement");
+        } finally {
+            setLoading(false);
+        }
+    };
     useEffect(() => {
         if (user?.id) {
             hasCenteredMapRef.current = false;
-            fetchCollectorId();
+            fetchMissions();
             fetchUserProfile();
             requestLocationPermission();
         }
         return () => stopLocationTracking();
     }, [user]);
 
-// Once collectorId is available, fetch missions
+    // Center map on markers when they load
     useEffect(() => {
-        if (collectorId) {
-            fetchMissions();               // ✅ only run when collectorId is defined
+        if (!hasCenteredMapRef.current && missions.length > 0 && mapRef.current) {
+            const validMissions = missions.filter(m =>
+                !isNaN(m.location_lat) && !isNaN(m.location_lng)
+            );
+
+            if (validMissions.length === 0) return;
+
+            const latitudes = validMissions.map(m => m.location_lat);
+            const longitudes = validMissions.map(m => m.location_lng);
+
+            const minLat = Math.min(...latitudes);
+            const maxLat = Math.max(...latitudes);
+            const minLng = Math.min(...longitudes);
+            const maxLng = Math.max(...longitudes);
+
+            const midLat = (minLat + maxLat) / 2;
+            const midLng = (minLng + maxLng) / 2;
+
+            const latitudeDelta = Math.max((maxLat - minLat) * 1.5, 0.02);
+            const longitudeDelta = Math.max((maxLng - minLng) * 1.5, 0.02);
+
+            mapRef.current.animateToRegion({
+                latitude: midLat,
+                longitude: midLng,
+                latitudeDelta,
+                longitudeDelta
+            }, 1000);
+
+            hasCenteredMapRef.current = true;
         }
-    }, [collectorId]);
+    }, [missions]);
 
-    useEffect(() => {
-        const interval = setInterval(() => {
-            fetchTodaysCommissions();
-        }, 30000);
-
-        return () => clearInterval(interval);
-    }, []);
-
-    const fetchCollectorId = async () => {
-        const { data, error } = await supabase
-            .from('collectors')
-            .select('id')
-            .eq('user_id', user.id)
-            .single();
-
-        if (!error && data) {
-            setCollectorId(data.id);
-        } else {
-            console.error('Erreur récupération collector:', error);
-        }
-    };
-    const fetchMissions = async () => {
-        if (!collectorId) return;
-
-        setLoading(true);
-        const { data, error } = await supabase
-            .from('donor_addresses')
-            .select('*')
-            .eq('collector_id', collectorId); // ✅ ici, on filtre par collector_id
-
-        if (!error && data) setMissions(data);
-        setLoading(false);
-        fetchTodaysCommissions();
-    };
-
+    // Other functions remain the same as in your original code
     const fetchUserProfile = async () => {
         const { data, error } = await supabase
             .from('users')
@@ -133,6 +221,7 @@ const QuebecMapScreen = ({ navigation }) => {
             .single();
         if (data && !error) setUserProfileImage(data.profile_image);
     };
+
     const fetchProfileData = async () => {
         if (!user?.id) return;
 
@@ -148,6 +237,7 @@ const QuebecMapScreen = ({ navigation }) => {
             if (userRes.data && !userRes.error) {
                 setUserProfileImage(userRes.data.profile_image || 'https://via.placeholder.com/150');
             }
+
             const collectorRes = await supabase
                 .from('collectors')
                 .select('id, wallet_balance, total_collected')
@@ -177,20 +267,90 @@ const QuebecMapScreen = ({ navigation }) => {
             setProfileLoading(false);
         }
     };
-    const insertCollectorLocation = async coords => {
+    const insertCollectorLocation = async (coords) => {
         if (!collectorId) return;
+        const now = Date.now();
+        // Only insert every 30 seconds instead of 5 seconds
+        if (now - lastLocationInsert.current < 30000) {
+            return;
+        }
+        try {
+            const { error } = await supabase.from('collector_locations').insert([{
+                collector_id: collectorId,
+                latitude: coords.latitude,
+                longitude: coords.longitude,
+                status: 'actif',
+                timestamp: new Date().toISOString()
+            }]);
 
-        const { error } = await supabase.from('collector_locations').insert([{
-            collector_id: collectorId,
-            latitude: coords.latitude,
-            longitude: coords.longitude,
-            status: 'actif',
-            timestamp: new Date().toISOString()
-        }]);
-
-        if (error) console.error('Erreur insertion localisation:', error);
+            if (!error) {
+                lastLocationInsert.current = now;
+            }
+        } catch (err) {
+            console.error('Location insert error:', err);
+            // Don't throw - just log and continue
+        }
     };
+    const startRecording = async () => {
+        if (isRecording || recordPath) {
+            console.log("🔁 Enregistrement déjà actif.");
+            return;
+        }
 
+        const granted = await requestAudioPermission();
+        if (!granted) {
+            Alert.alert("Micro refusé", "Veuillez activer le micro dans les réglages.");
+            return;
+        }
+
+        const path = `${RNFS.DocumentDirectoryPath}/recording_${Date.now()}.mp4`;
+
+        try {
+            setRecordPath(path); // définir AVANT pour éviter double appel
+            await audioRecorderPlayer.startRecorder(path);
+            setRecordStartTime(Date.now());
+            setIsRecording(true);
+            console.log("🎙️ Démarré:", path);
+        } catch (error) {
+            console.error("❌ startRecording:", error);
+            setRecordPath('');
+            setIsRecording(false);
+        }
+    };
+    const stopRecordingAndSave = async () => {
+        if (!recordPath || !isRecording || !recordStartTime) {
+            console.log("⛔ Aucun enregistrement valide à sauvegarder.");
+            return;
+        }
+
+        try {
+            await audioRecorderPlayer.stopRecorder();
+            audioRecorderPlayer.removeRecordBackListener();
+            setIsRecording(false);
+
+            const durationSec = Math.max(1, Math.round((Date.now() - recordStartTime) / 1000));
+
+            const { error } = await supabase.from('donation_recordings').insert([
+                {
+                    collector_id: user?.id,
+                    audio_url: recordPath,
+                    duration: durationSec,
+                    created_at: new Date().toISOString(),
+                },
+            ]);
+
+            if (error) {
+                console.error("❌ Erreur insertion Supabase:", error);
+            } else {
+                console.log(`✅ Enregistrement sauvegardé localement (${durationSec}s)`);
+            }
+        } catch (err) {
+            console.error("❌ stopRecordingAndSave:", err);
+        } finally {
+            setRecordPath('');
+            setRecordStartTime(null);
+        }
+    };
     const requestLocationPermission = async () => {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted') {
@@ -199,18 +359,9 @@ const QuebecMapScreen = ({ navigation }) => {
         }
         startLocationTracking();
     };
+
     const fetchTodaysCommissions = async () => {
-        if (!user?.id) return;
-
-        const { data: collectorData, error: collectorError } = await supabase
-            .from('collectors')
-            .select('id')
-            .eq('user_id', user.id)
-            .single();
-
-        if (collectorError || !collectorData) return;
-
-        const collectorId = collectorData.id;
+        if (!collectorId) return;
 
         const startOfDay = new Date();
         startOfDay.setHours(0, 0, 0, 0);
@@ -227,25 +378,44 @@ const QuebecMapScreen = ({ navigation }) => {
         const totalCollectedToday = donations.reduce((sum, d) => sum + (parseFloat(d.amount) || 0), 0);
         const commission = totalCollectedToday * 0.35;
 
-        // ✅ mise à jour de la base
         await supabase
             .from('collectors')
             .update({ commission })
             .eq('id', collectorId);
 
-        // ✅ mise à jour locale
         setTodaysCommissions(commission);
     };
 
     const startLocationTracking = async () => {
-        const sub = await Location.watchPositionAsync(
-            { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 5 },
-            ({ coords }) => {
-                setUserLocation(coords);
-                insertCollectorLocation(coords);
+        try {
+            // Check if already tracking
+            if (watchId) {
+                return;
             }
-        );
-        setWatchId(sub);
+
+            const sub = await Location.watchPositionAsync(
+                {
+                    accuracy: Location.Accuracy.Balanced, // Changed from High to Balanced
+                    timeInterval: 10000, // Increased from 5000 to 10000
+                    distanceInterval: 10  // Increased from 5 to 10
+                },
+                handleLocationUpdate,
+            );
+            setWatchId(sub);
+        } catch (error) {
+            console.error('Location tracking error:', error);
+        }
+    };
+    const handleLocationUpdate = (coords) => {
+        setUserLocation(coords);
+
+        if (locationUpdateTimeout.current) {
+            clearTimeout(locationUpdateTimeout.current);
+        }
+
+        locationUpdateTimeout.current = setTimeout(() => {
+            insertCollectorLocation(coords);
+        }, 1000);
     };
 
     const stopLocationTracking = () => {
@@ -253,36 +423,58 @@ const QuebecMapScreen = ({ navigation }) => {
             watchId.remove();
             setWatchId(null);
         }
+        if (locationUpdateTimeout.current) {
+            clearTimeout(locationUpdateTimeout.current);
+            locationUpdateTimeout.current = null;
+        }
     };
-    const hasCenteredMapRef = useRef(false);
+    useEffect(() => {
+        let mounted = true;
+
+        const init = async () => {
+            if (user?.id && mounted) {
+                await fetchMissions();
+                await requestLocationPermission();
+                await startRecording(); // ▶️
+            }
+        };
+
+        init();
+
+        return () => {
+            mounted = false;
+            stopLocationTracking();
+            stopRecordingAndSave(); // ⏹️
+        };
+    }, []);
+    useEffect(() => {
+        const handleAppStateChange = (state) => {
+            if (state === 'background' || state === 'inactive') {
+                stopRecordingAndSave();
+            } else if (state === 'active' && user?.id) {
+                if (!isRecording) startRecording();
+            }
+        };
+
+        const sub = AppState.addEventListener('change', handleAppStateChange);
+        return () => sub.remove();
+    }, [user?.id, isRecording]);
 
     useEffect(() => {
-        if (!hasCenteredMapRef.current && missions.length > 0 && mapRef.current) {
-            const latitudes = missions.map(m => parseFloat(m.location_lat));
-            const longitudes = missions.map(m => parseFloat(m.location_lng));
+        const handleAppStateChange = (nextAppState) => {
+            if (nextAppState === 'background' || nextAppState === 'inactive') {
+                stopLocationTracking();
+            } else if (nextAppState === 'active' && user?.id) {
+                startLocationTracking();
+            }
+        };
 
-            const minLat = Math.min(...latitudes);
-            const maxLat = Math.max(...latitudes);
-            const minLng = Math.min(...longitudes);
-            const maxLng = Math.max(...longitudes);
+        const subscription = AppState.addEventListener('change', handleAppStateChange);
 
-            const midLat = (minLat + maxLat) / 2;
-            const midLng = (minLng + maxLng) / 2;
-
-            const latitudeDelta = Math.max((maxLat - minLat) * 1.5, 0.02);
-            const longitudeDelta = Math.max((maxLng - minLng) * 1.5, 0.02);
-
-            mapRef.current.animateToRegion({
-                latitude: midLat,
-                longitude: midLng,
-                latitudeDelta,
-                longitudeDelta
-            }, 1000);
-
-            hasCenteredMapRef.current = true;
-        }
-    }, [missions]);
-
+        return () => {
+            subscription?.remove();
+        };
+    }, [user?.id]);
 
     const showPopup = mission => {
         setSelectedAddress(mission);
@@ -294,27 +486,33 @@ const QuebecMapScreen = ({ navigation }) => {
             setSelectedAddress(null);
         });
     };
+
     const openRecordModal = () => {
         if (!selectedAddress) return;
+
+        if (!selectedAddress?.location_lat || !selectedAddress?.location_lng ||
+            isNaN(selectedAddress.location_lat) || isNaN(selectedAddress.location_lng)) {
+            Alert.alert("Erreur", "Coordonnées de l'adresse invalides");
+            return;
+        }
+
         setRecordAddress(selectedAddress);
         hidePopup();
         setShowRecordModal(true);
         setCurrentPage(1);
 
-        if (userLocation && selectedAddress?.location_lat && selectedAddress?.location_lng) {
+        if (userLocation && userLocation.latitude && userLocation.longitude) {
             const distance = getDistanceFromLatLonInMeters(
                 userLocation.latitude,
                 userLocation.longitude,
-                parseFloat(selectedAddress.location_lat),
-                parseFloat(selectedAddress.location_lng)
+                selectedAddress.location_lat,
+                selectedAddress.location_lng
             );
-            console.log('Distance à la mission:', distance, 'mètres');
-            setIsNearAddress(distance <= 50);
-        } else {
-            setIsNearAddress(false);
+            console.log('Distance exacte:', distance, 'mètres');
         }
-    };
+// toujours autorisé
 
+    };
     const closeModal = () => {
         setShowRecordModal(false);
         setCurrentPage(1);
@@ -326,9 +524,11 @@ const QuebecMapScreen = ({ navigation }) => {
         setModalVisible(true);
         fetchProfileData();
     };
+
     const closeProfileModal = () => {
         setModalVisible(false);
     };
+
     const renderPageContent = () => {
         switch (currentPage) {
             case 1:
@@ -379,26 +579,11 @@ const QuebecMapScreen = ({ navigation }) => {
                             style={styles.textInput}
                         />
                         <Text>Type de don</Text>
-                        {['Espèces', 'Carte bancaire'].map(type => (
+                        {['Espèces','Carte bancaire'].map(type => (
                             <TouchableOpacity
                                 key={type}
-                                onPress={() => {
-                                    setVisitData({ ...visitData, donationType: type });
-
-                                    if (type === 'Carte bancaire') {
-                                        const amount = parseFloat(visitData.donationAmount || '0');
-                                        if (isNaN(amount) || amount <= 0) {
-                                            Alert.alert('Erreur', 'Veuillez entrer un montant valide avant de payer par carte.');
-                                            return;
-                                        }
-
-                                        navigation.navigate('payment', {
-                                            amount: amount * 100 // montant en centimes
-                                        });
-                                    }
-                                }}
-                                style={[styles.optionButton, visitData.donationType === type && styles.optionButtonActive]}
-                            >
+                                onPress={() => setVisitData({ ...visitData, donationType: type })}
+                                style={[styles.optionButton, visitData.donationType === type && styles.optionButtonActive]}>
                                 <Text style={visitData.donationType === type ? styles.optionTextActive : styles.optionText}>
                                     {type}
                                 </Text>
@@ -420,6 +605,7 @@ const QuebecMapScreen = ({ navigation }) => {
                 return null;
         }
     };
+
     const submitFreeDonation = async () => {
         const amount = parseFloat(freeDonationData.donationAmount);
         if (!freeDonationData.contactPerson || !freeDonationData.email || isNaN(amount) || amount <= 0) {
@@ -463,7 +649,6 @@ const QuebecMapScreen = ({ navigation }) => {
             fetchMissions();
             await fetchTodaysCommissions();
             Alert.alert('Succès', 'Donation enregistrée !');
-
         }
     };
 
@@ -486,6 +671,7 @@ const QuebecMapScreen = ({ navigation }) => {
             setCurrentPage(currentPage - 1);
         }
     };
+
     const submitVisitRecord = async () => {
         try {
             if (!recordAddress?.id) {
@@ -513,7 +699,7 @@ const QuebecMapScreen = ({ navigation }) => {
 
                 const { data: collector, error: collectorError } = await supabase
                     .from('collectors')
-                    .select('id, wallet_balance, total_collected') // ✅ on récupère total_collected aussi
+                    .select('id, wallet_balance, total_collected')
                     .eq('user_id', user.id)
                     .single();
 
@@ -531,7 +717,7 @@ const QuebecMapScreen = ({ navigation }) => {
                         amount,
                         payment_method: visitData.donationType,
                         status: 'completed',
-                        collector_id: collector.id, // ✅ Ici, le vrai collector_id
+                        collector_id: collector.id,
                         created_at: new Date().toISOString()
                     }]);
 
@@ -546,7 +732,6 @@ const QuebecMapScreen = ({ navigation }) => {
                             total_collected: newTotalCollected
                         })
                         .eq('id', collector.id);
-
                 }
             }
 
@@ -559,7 +744,27 @@ const QuebecMapScreen = ({ navigation }) => {
         }
         await fetchTodaysCommissions();
     };
+    useEffect(() => {
+        if (missions.length > 0 && mapRef.current) {
+            const latitudes = missions.map(m => m.location_lat);
+            const longitudes = missions.map(m => m.location_lng);
 
+            const minLat = Math.min(...latitudes);
+            const maxLat = Math.max(...latitudes);
+            const minLng = Math.min(...longitudes);
+            const maxLng = Math.max(...longitudes);
+
+            const midLat = (minLat + maxLat) / 2;
+            const midLng = (minLng + maxLng) / 2;
+
+            mapRef.current.animateToRegion({
+                latitude: midLat,
+                longitude: midLng,
+                latitudeDelta: (maxLat - minLat) * 1.5,
+                longitudeDelta: (maxLng - minLng) * 1.5,
+            }, 1000);
+        }
+    }, [missions]);
     const renderNavItem = (iconName, label, isActive, onPress) => {
         return (
             <TouchableOpacity style={styles.navItem} onPress={onPress}>
@@ -569,13 +774,12 @@ const QuebecMapScreen = ({ navigation }) => {
         );
     };
 
-    // --- couleurs et loader ---
     const getStatusColor = status => {
         switch(status){
             case 'visité et accepté': return '#7ED321';
             case 'visité et refusé':  return '#D0021B';
             case 'absent':            return '#F5A623';
-            default:                  return '#9B9B9B';
+            default:                  return 'blue';
         }
     };
 
@@ -593,54 +797,32 @@ const QuebecMapScreen = ({ navigation }) => {
                 style={styles.map}
                 showsUserLocation
                 showsMyLocationButton
-                onMapReady={() => {
-                    if (missions.length > 0 && mapRef.current) {
-                        const latitudes = missions.map(m => parseFloat(m.location_lat));
-                        const longitudes = missions.map(m => parseFloat(m.location_lng));
-                        const minLat = Math.min(...latitudes);
-                        const maxLat = Math.max(...latitudes);
-                        const minLng = Math.min(...longitudes);
-                        const maxLng = Math.max(...longitudes);
-                        const midLat = (minLat + maxLat) / 2;
-                        const midLng = (minLng + maxLng) / 2;
-                        const latitudeDelta = Math.max((maxLat - minLat) * 1.5, 0.02);
-                        const longitudeDelta = Math.max((maxLng - minLng) * 1.5, 0.02);
-
-                        mapRef.current.animateToRegion({
-                            latitude: midLat,
-                            longitude: midLng,
-                            latitudeDelta,
-                            longitudeDelta,
-                        }, 1000);
-                    }
-                }}
             >
-
-            {missions
-                    .filter(m => !filteredStatus || m.status === filteredStatus)
-                    .map(m => (
-                        <Marker
-                            key={m.id}
-                            coordinate={{
-                                latitude: Number(m.location_lat),
-                                longitude: Number(m.location_lng)
-                            }}
-                            onPress={() => showPopup(m)}
-                        >
-                            <View style={[styles.markerCircle, { backgroundColor: getStatusColor(m.status) }]}>
-                                <FontAwesome name="home" size={20} color="white"/>
-                            </View>
-                        </Marker>
-                    ))}
+                {missions.filter(m =>
+                    !isNaN(m.location_lat) && !isNaN(m.location_lng)
+                ).map(m => (
+                    <Marker
+                        key={m.id}
+                        coordinate={{
+                            latitude: m.location_lat,
+                            longitude: m.location_lng
+                        }}
+                        onPress={() => showPopup(m)}
+                    >
+                        <View style={[styles.markerCircle, { backgroundColor: getStatusColor(m.status) }]}>
+                            <FontAwesome name="home" size={20} color="white"/>
+                        </View>
+                    </Marker>
+                ))}
             </MapView>
             <View style={styles.dailyCommissionContainer}>
                 <Text style={styles.dailyCommissionText}>${todaysCommissions.toFixed(2)}</Text>
             </View>
-            {}
+
             <View style={styles.statusFilterContainer}>
                 {['non visité','visité et accepté','visité et refusé','absent'].map(status => {
                     const isActive = filteredStatus === status;
-                    const color    = getStatusColor(status);
+                    const color = getStatusColor(status);
                     return (
                         <TouchableOpacity
                             key={status}
@@ -659,8 +841,6 @@ const QuebecMapScreen = ({ navigation }) => {
                     );
                 })}
             </View>
-
-            {/* popup détails */}
             {selectedAddress && (
                 <>
                     <TouchableOpacity style={styles.overlay} onPress={hidePopup} activeOpacity={1}/>
@@ -675,8 +855,8 @@ const QuebecMapScreen = ({ navigation }) => {
                     ]}>
                         <Text style={styles.modalTitle}>Détails de l'adresse</Text>
                         <Text>Adresse: {selectedAddress.address}</Text>
-                        <Text>Ville: {selectedAddress.city}</Text>
                         <Text>Statut: {selectedAddress.status}</Text>
+                        <Text>Coordonnées: {selectedAddress.location_lat?.toFixed(6)}, {selectedAddress.location_lng?.toFixed(6)}</Text>
                         <View style={styles.actionButtonsContainer}>
                             <TouchableOpacity
                                 style={[styles.actionButton, { backgroundColor:'#5B6CFF'}]}
@@ -689,22 +869,14 @@ const QuebecMapScreen = ({ navigation }) => {
                                 <MaterialIcons name="navigation" size={20} color="white"/>
                                 <Text style={styles.actionButtonText}>Itinéraire</Text>
                             </TouchableOpacity>
-                            {isNearAddress ? (
-                                <TouchableOpacity
-                                    style={[styles.actionButton, { backgroundColor: '#A569C1' }]}
-                                    onPress={openRecordModal}
-                                >
-                                    <MaterialIcons name="edit" size={20} color="white"/>
-                                    <Text style={styles.actionButtonText}>Enregistrer visite</Text>
-                                </TouchableOpacity>
-                            ) : (
-                                <View style={[styles.actionButton, { backgroundColor: '#eee' }]}>
-                                    <MaterialIcons name="error-outline" size={20} color="#D0021B" />
-                                    <Text style={styles.distanceWarningText}>
-                                        Trop loin de l’adresse
-                                    </Text>
-                                </View>
-                            )}
+
+                            <TouchableOpacity
+                                style={[styles.actionButton, { backgroundColor: '#A569C1' }]}
+                                onPress={openRecordModal}
+                            >
+                                <MaterialIcons name="edit" size={20} color="white"/>
+                                <Text style={styles.actionButtonText}>Enregistrer visite</Text>
+                            </TouchableOpacity>
                         </View>
                         <TouchableOpacity style={styles.closeButton} onPress={hidePopup}>
                             <MaterialIcons name="close" size={24} color="white"/>
@@ -713,7 +885,7 @@ const QuebecMapScreen = ({ navigation }) => {
                 </>
             )}
 
-            {/* modal enregistrement */}
+
             <Modal animationType="slide" transparent visible={showRecordModal} onRequestClose={closeModal}>
                 <View style={styles.modalOverlay}>
                     <View style={styles.modalContent}>
@@ -755,7 +927,6 @@ const QuebecMapScreen = ({ navigation }) => {
                 </View>
             </Modal>
 
-            {/* Modal Profil */}
             <Modal animationType="slide" transparent visible={isModalVisible} onRequestClose={closeProfileModal}>
                 <View style={styles.profileModalOverlay}>
                     <View style={styles.profileModalContent}>
@@ -801,8 +972,8 @@ const QuebecMapScreen = ({ navigation }) => {
                                             <TouchableOpacity
                                                 style={[styles.profileActionButton, { backgroundColor: '#5B6CFF' }]}
                                                 onPress={() => {
-                                                    closeProfileModal(); // fermer modal
-                                                    navigation.navigate('profile'); // aller vers EditProfileScreen
+                                                    closeProfileModal();
+                                                    navigation.navigate('profile');
                                                 }}
                                             >
                                                 <MaterialIcons name="edit" size={20} color="white" />
@@ -813,8 +984,7 @@ const QuebecMapScreen = ({ navigation }) => {
                                                 style={[styles.profileActionButton, { backgroundColor: '#D0021B' }]}
                                                 onPress={async () => {
                                                     closeProfileModal();
-                                                    const { signOut } = useAuth(); // utiliser ton contexte d'auth
-                                                    await signOut(); // exécute la déconnexion
+                                                    navigation.navigate('Login');
                                                 }}
                                             >
                                                 <MaterialIcons name="logout" size={20} color="white" />
@@ -840,7 +1010,6 @@ const QuebecMapScreen = ({ navigation }) => {
                 </View>
             </Modal>
 
-            {/* Bottom Navigation */}
             <View style={styles.bottomNav}>
                 {renderNavItem('home', 'Accueil', false, () => navigation.navigate('Dashboard'))}
                 {renderNavItem('account-balance-wallet', 'Wallet', false, () => navigation.navigate('wallet'))}
@@ -855,6 +1024,7 @@ const QuebecMapScreen = ({ navigation }) => {
                     <Text style={styles.navText}>Profil</Text>
                 </TouchableOpacity>
             </View>
+
             <TouchableOpacity
                 style={styles.floatingButton}
                 onPress={() => {
@@ -910,23 +1080,7 @@ const QuebecMapScreen = ({ navigation }) => {
                         {['Espèces', 'Carte bancaire'].map(type => (
                             <TouchableOpacity
                                 key={type}
-                                onPress={() => {
-                                    setFreeDonationData({ ...freeDonationData, donationType: type });
-
-                                    if (type === 'Carte bancaire') {
-                                        const amount = parseFloat(freeDonationData.donationAmount || '0');
-                                        if (!freeDonationData.contactPerson || !freeDonationData.email || isNaN(amount) || amount <= 0) {
-                                            Alert.alert('Erreur', 'Veuillez remplir tous les champs avec un montant valide.');
-                                            return;
-                                        }
-
-                                        setShowFreeDonationModal(false); // ferme le modal
-
-                                        navigation.navigate('payment', {
-                                            amount: amount * 100 // en centimes
-                                        });
-                                    }
-                                }}
+                                onPress={() => setFreeDonationData({ ...freeDonationData, donationType: type })}
                                 style={[styles.optionButton, freeDonationData.donationType === type && styles.optionButtonActive]}
                             >
                                 <Text style={freeDonationData.donationType === type ? styles.optionTextActive : styles.optionText}>
@@ -947,110 +1101,53 @@ const QuebecMapScreen = ({ navigation }) => {
                     </View>
                 </View>
             </Modal>
-
         </View>
     );
 };
 
 const styles = StyleSheet.create({
-    container: { flex:1 },
-    floatingButton: {
-        position: 'absolute',
-        bottom: 100,
-        right: 20,
-        backgroundColor: '#8B5CF6',
-        padding: 14,
-        borderRadius: 50,
-        elevation: 5,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.3,
-        shadowRadius: 3,
-    },
-    map: { flex: 1 },
-    center: { flex:1, justifyContent:'center', alignItems:'center' },
-
-    statusFilterContainer: {
-        position: 'absolute',
-        top: 40,
-        left: 10,
-        right: 10,
-        flexDirection: 'row',
-        justifyContent: 'space-around',
-        padding: 6,
-        elevation: 4,
-    },
-    statusIconButton: {
-        width: 40, height: 40,
-        borderRadius: 20,
-        alignItems: 'center', justifyContent: 'center',
-    },
-
     markerCircle: {
-        width: 30, height: 30,
+        width: 30,
+        height: 30,
         borderRadius: 15,
-        alignItems:'center', justifyContent:'center',
-        elevation: 4,
+        alignItems: 'center',
+        justifyContent: 'center'
     },
-    distanceWarningText: {
-        marginTop: 8,
-        color: '#D0021B',
-        fontSize: 14,
-        textAlign: 'center',
-        fontWeight: '600',
+    container: {
+        flex: 1,
     },
-    overlay: { position:'absolute', left:0, top:0, right:0, bottom:0, backgroundColor:'rgba(0,0,0,0.23)', zIndex:90 },
-    popup: { position:'absolute', bottom:100, left:0, right:0, backgroundColor:'#FFF', borderTopLeftRadius:22, borderTopRightRadius:22, elevation:16, padding:18, zIndex:100 },
-    modalTitle: { fontWeight:'bold', fontSize:18, color:'#A569C1' },
-    closeButton: { padding:6 },
-    closeButtonText: { fontSize:22, color:'#A569C1', fontWeight:'bold' },
-    actionButtonsContainer: { flexDirection:'row', justifyContent:'space-between', marginTop:12 },
-    actionButton: { flex:1, flexDirection:'row', alignItems:'center', justifyContent:'center', borderRadius:12, paddingVertical:10, marginHorizontal:6 },
-    actionButtonText: { color:'white', fontWeight:'bold', fontSize:15, marginLeft:8 },
-    dailyCommissionContainer: {
+    map: {
+        width: '100%',
+        height: '100%',
+    },
+    modalContainer: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    modalContent: {
+        width: '85%',
+        backgroundColor: 'white',
+        borderRadius: 10,
+        padding: 20,
+    },
+    totalCounter: {
         position: 'absolute',
-        top: 50,
+        top: 20,
         alignSelf: 'center',
-        backgroundColor: '#222',
-        paddingVertical: 6,
-        paddingHorizontal: 16,
+        backgroundColor: 'rgba(0,0,0,0.8)',
+        paddingVertical: 10,
+        paddingHorizontal: 20,
         borderRadius: 20,
-        zIndex: 10,
-        elevation: 5,
+        zIndex: 1000
     },
-    dailyCommissionText: {
+    counterText: {
         color: 'white',
-        fontSize: 18,
         fontWeight: 'bold',
+        fontSize: 16,
+        textAlign: 'center'
     },
-    modalOverlay: { flex:1, backgroundColor:'rgba(0,0,0,0.16)', justifyContent:'center', alignItems:'center', zIndex:999 },
-    modalContent: { width:'90%', maxHeight:'90%', backgroundColor:'#fff', borderRadius:18, paddingHorizontal:12, paddingBottom:18, elevation:10 },
-    modalHeader: { flexDirection:'row', justifyContent:'space-between', alignItems:'center', paddingVertical:13, paddingHorizontal:6 },
-
-    progressContainer: { alignItems:'center', marginBottom:10 },
-    progressBar: { width:'92%', height:7, backgroundColor:'#eee', borderRadius:6, overflow:'hidden' },
-    progressFill: { height:7, backgroundColor:'#A569C1', borderRadius:6 },
-
-    modalScrollContent: { maxHeight:300 },
-    navigationButtons: { flexDirection:'row', marginTop:12, alignItems:'center', justifyContent:'space-between' },
-    navButton: { flexDirection:'row', alignItems:'center', borderRadius:7, paddingHorizontal:18, paddingVertical:9 },
-    prevButton: { backgroundColor:'#eee', marginRight:10 },
-    prevButtonText: { color:'#333', marginLeft:6, fontWeight:'bold' },
-    nextButton: { backgroundColor:'#A569C1', marginLeft:10 },
-    nextButtonText: { color:'white', marginRight:6, fontWeight:'bold' },
-    submitButton: { backgroundColor:'#7ED321' },
-    submitButtonText: { color:'white', marginLeft:8, fontWeight:'bold', fontSize:16 },
-    flexSpacer: { flex:1 },
-
-    textInput: { borderColor:'#ddd', borderWidth:1, borderRadius:8, padding:8, marginVertical:6, fontSize:15 },
-    optionButton: { backgroundColor:'#eee', padding:12, marginVertical:6, borderRadius:8 },
-    optionButtonActive: { backgroundColor:'#A569C1' },
-    optionText: { color:'#333' },
-    optionTextActive: { color:'white' },
-
-    summaryTitle: { fontWeight:'bold', fontSize:16, marginBottom:8 },
-
-    // Styles pour le bottom navigation
     bottomNav: {
         position: 'absolute',
         bottom: 20,
@@ -1062,10 +1159,7 @@ const styles = StyleSheet.create({
         paddingHorizontal: 20,
         borderRadius: 25,
         shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: 4,
-        },
+        shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.15,
         shadowRadius: 8,
         elevation: 12,
@@ -1091,27 +1185,6 @@ const styles = StyleSheet.create({
         borderWidth: 1,
         borderColor: '#e0e0e0',
     },
-    profileButtonGroup: {
-        paddingHorizontal: 10,
-        paddingBottom: 30,
-        gap: 12,
-    },
-    profileActionButton: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
-        borderRadius: 12,
-        paddingVertical: 12,
-        paddingHorizontal: 15,
-        elevation: 2,
-    },
-    profileActionText: {
-        color: 'white',
-        fontWeight: 'bold',
-        fontSize: 16,
-        marginLeft: 8,
-    },
-
     navText: {
         fontSize: 12,
         color: '#9CA3AF',
@@ -1122,8 +1195,228 @@ const styles = StyleSheet.create({
         color: '#8B5CF6',
         fontWeight: '600',
     },
-
-    // Styles pour le modal profil
+    floatingButton: {
+        position: 'absolute',
+        bottom: 100,
+        right: 20,
+        backgroundColor: '#8B5CF6',
+        padding: 14,
+        borderRadius: 50,
+        elevation: 5,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.3,
+        shadowRadius: 3,
+    },
+    modalTitle: {
+        fontWeight: 'bold',
+        fontSize: 18,
+        marginBottom: 10
+    },
+    label: {
+        fontWeight: 'bold'
+    },
+    closeButton: {
+        marginTop: 20,
+        backgroundColor: '#333',
+        padding: 10,
+        alignItems: 'center',
+        borderRadius: 8,
+    },
+    dailyCommissionContainer: {
+        position: 'absolute',
+        top: 50,
+        alignSelf: 'center',
+        backgroundColor: '#222',
+        paddingVertical: 6,
+        paddingHorizontal: 16,
+        borderRadius: 20,
+        zIndex: 10,
+        elevation: 5,
+    },
+    dailyCommissionText: {
+        color: 'white',
+        fontSize: 18,
+        fontWeight: 'bold',
+    },
+    statusFilterContainer: {
+        position: 'absolute',
+        top: 40,
+        left: 10,
+        right: 10,
+        flexDirection: 'row',
+        justifyContent: 'space-around',
+        padding: 6,
+        elevation: 4,
+    },
+    statusIconButton: {
+        width: 40,
+        height: 40,
+        borderRadius: 20,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    statusButtonContent: {
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    statusCountText: {
+        fontSize: 12,
+        fontWeight: 'bold',
+        marginTop: 2,
+    },
+    overlay: {
+        position: 'absolute',
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        backgroundColor: 'rgba(0,0,0,0.23)',
+        zIndex: 90
+    },
+    popup: {
+        position: 'absolute',
+        bottom: 100,
+        left: 0,
+        right: 0,
+        backgroundColor: '#FFF',
+        borderTopLeftRadius: 22,
+        borderTopRightRadius: 22,
+        elevation: 16,
+        padding: 18,
+        zIndex: 100
+    },
+    actionButtonsContainer: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginTop: 12
+    },
+    actionButton: {
+        flex: 1,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderRadius: 12,
+        paddingVertical: 10,
+        marginHorizontal: 6
+    },
+    actionButtonText: {
+        color: 'white',
+        fontWeight: 'bold',
+        fontSize: 15,
+        marginLeft: 8
+    },
+    distanceWarningText: {
+        marginTop: 8,
+        color: '#D0021B',
+        fontSize: 14,
+        textAlign: 'center',
+        fontWeight: '600',
+    },
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.16)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        zIndex: 999
+    },
+    modalHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingVertical: 13,
+        paddingHorizontal: 6
+    },
+    progressContainer: {
+        alignItems: 'center',
+        marginBottom: 10
+    },
+    progressBar: {
+        width: '92%',
+        height: 7,
+        backgroundColor: '#eee',
+        borderRadius: 6,
+        overflow: 'hidden'
+    },
+    progressFill: {
+        height: 7,
+        backgroundColor: '#A569C1',
+        borderRadius: 6
+    },
+    modalScrollContent: {
+        maxHeight: 300
+    },
+    navigationButtons: {
+        flexDirection: 'row',
+        marginTop: 12,
+        alignItems: 'center',
+        justifyContent: 'space-between'
+    },
+    navButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        borderRadius: 7,
+        paddingHorizontal: 18,
+        paddingVertical: 9
+    },
+    prevButton: {
+        backgroundColor: '#eee',
+        marginRight: 10
+    },
+    prevButtonText: {
+        color: '#333',
+        marginLeft: 6,
+        fontWeight: 'bold'
+    },
+    nextButton: {
+        backgroundColor: '#A569C1',
+        marginLeft: 10
+    },
+    nextButtonText: {
+        color: 'white',
+        marginRight: 6,
+        fontWeight: 'bold'
+    },
+    submitButton: {
+        backgroundColor: '#7ED321'
+    },
+    submitButtonText: {
+        color: 'white',
+        marginLeft: 8,
+        fontWeight: 'bold',
+        fontSize: 16
+    },
+    flexSpacer: {
+        flex: 1
+    },
+    textInput: {
+        borderColor: '#ddd',
+        borderWidth: 1,
+        borderRadius: 8,
+        padding: 8,
+        marginVertical: 6,
+        fontSize: 15
+    },
+    optionButton: {
+        backgroundColor: '#eee',
+        padding: 12,
+        marginVertical: 6,
+        borderRadius: 8
+    },
+    optionButtonActive: {
+        backgroundColor: '#A569C1'
+    },
+    optionText: {
+        color: '#333'
+    },
+    optionTextActive: {
+        color: 'white'
+    },
+    summaryTitle: {
+        fontWeight: 'bold',
+        fontSize: 16,
+        marginBottom: 8
+    },
     profileModalOverlay: {
         flex: 1,
         backgroundColor: 'rgba(0,0,0,0.5)',
@@ -1265,6 +1558,26 @@ const styles = StyleSheet.create({
     profileDonationDate: {
         fontSize: 14,
         color: '#6B7280',
+    },
+    profileButtonGroup: {
+        paddingHorizontal: 10,
+        paddingBottom: 30,
+        gap: 12,
+    },
+    profileActionButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderRadius: 12,
+        paddingVertical: 12,
+        paddingHorizontal: 15,
+        elevation: 2,
+    },
+    profileActionText: {
+        color: 'white',
+        fontWeight: 'bold',
+        fontSize: 16,
+        marginLeft: 8,
     },
 });
 export default QuebecMapScreen;
