@@ -1,5 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, ScrollView, Image, Dimensions, TouchableOpacity } from 'react-native';
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  Image,Modal,
+  Dimensions,
+  TouchableOpacity,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../supabase';
@@ -19,7 +27,7 @@ export default function DashboardScreen() {
   const [recentTransactions, setRecentTransactions] = useState([]);
   const [userProfileImage, setUserProfileImage] = useState('https://via.placeholder.com/150');
   const loginStartTimeRef = useRef(Date.now());
-
+  const [showProfileOptions, setShowProfileOptions] = useState(false);
   useEffect(() => {
     if (user?.id) fetchDashboardData();
   }, [user]);
@@ -34,7 +42,6 @@ export default function DashboardScreen() {
       const s = totalSeconds % 60;
       setRealTimeHMS(`${h}h ${m}m ${s}s`);
     }, 1000);
-
     return () => clearInterval(timer);
   }, []);
 
@@ -46,7 +53,6 @@ export default function DashboardScreen() {
       const { data: collector } = await supabase.from('collectors').select('id').eq('user_id', user.id).single();
       setCollectorId(collector?.id);
 
-      // Get today’s range 23h59 to 23h59
       const now = new Date();
       const startOfToday = new Date(now);
       startOfToday.setHours(23, 59, 0, 0);
@@ -55,7 +61,6 @@ export default function DashboardScreen() {
       endOfToday.setDate(endOfToday.getDate() + 1);
       endOfToday.setMilliseconds(999);
 
-      // Get week’s range (from last Monday 23h59 to next Monday 23h59)
       const currentDate = new Date();
       const lastMonday = new Date(currentDate);
       lastMonday.setDate(currentDate.getDate() - ((currentDate.getDay() + 6) % 7));
@@ -65,16 +70,8 @@ export default function DashboardScreen() {
       nextMonday.setMilliseconds(999);
 
       const [dayData, weekData] = await Promise.all([
-        supabase
-            .from('donations')
-            .select('collector_id, amount')
-            .gte('created_at', startOfToday.toISOString())
-            .lte('created_at', endOfToday.toISOString()),
-        supabase
-            .from('donations')
-            .select('collector_id, amount')
-            .gte('created_at', lastMonday.toISOString())
-            .lte('created_at', nextMonday.toISOString()),
+        supabase.from('donations').select('collector_id, amount').gte('created_at', startOfToday.toISOString()).lte('created_at', endOfToday.toISOString()),
+        supabase.from('donations').select('collector_id, amount').gte('created_at', lastMonday.toISOString()).lte('created_at', nextMonday.toISOString()),
       ]);
 
       const computeTop = (data) => {
@@ -88,7 +85,6 @@ export default function DashboardScreen() {
             .sort((a, b) => b.total_amount - a.total_amount)
             .slice(0, 5);
       };
-
       const topDay = computeTop(dayData.data || []);
       const topWeek = computeTop(weekData.data || []);
       const allTopIds = [...new Set([...topDay, ...topWeek].map(t => parseInt(t.collector_id)))];
@@ -125,20 +121,32 @@ export default function DashboardScreen() {
       console.error('Erreur chargement dashboard:', err);
     }
   }
-
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    navigation.reset({
+      index: 0,
+      routes: [{ name: 'AuthNavigator' }],
+    });
+  };
   return (
       <SafeAreaView style={styles.container}>
-        <View style={styles.header}>
-          <Image source={{ uri: userProfileImage }} style={styles.avatar} />
-          <View>
-            <Text style={styles.welcome}>Bienvenue</Text>
-            <Text style={styles.userName}>{userName}</Text>
+        <View style={styles.floatingHeader}>
+          <View style={styles.headerContent}>
+            <TouchableOpacity onPress={() => setShowProfileOptions(true)}>
+              <Image source={{ uri: userProfileImage }} style={styles.avatar} />
+            </TouchableOpacity>
+
+            <View>
+              <Text style={styles.welcome}>Bienvenue</Text>
+              <Text style={styles.userName}>{userName}</Text>
+            </View>
             <Image source={require('../../assets/logo_whte.png')} style={styles.logoAzirm} />
           </View>
         </View>
+
         <ScrollView contentContainerStyle={styles.content}>
           <View style={styles.grid}>
-            <View style={styles.boxPurple}>
+            <View style={styles.boxDark}>
               <Text style={styles.boxTitle}>Top 5 du jour</Text>
               {topDayAgents.map((a, i) => (
                   <View key={i} style={styles.agentRow}>
@@ -148,7 +156,7 @@ export default function DashboardScreen() {
               ))}
             </View>
 
-            <View style={styles.boxPurple}>
+            <View style={styles.boxDark}>
               <Text style={styles.boxTitle}>Top 5 semaine</Text>
               {topWeekAgents.map((a, i) => (
                   <View key={`week-${i}`} style={styles.agentRow}>
@@ -158,7 +166,7 @@ export default function DashboardScreen() {
               ))}
             </View>
 
-            <View style={styles.boxWhite}>
+            <View style={styles.boxDarkFull}>
               <Text style={styles.boxTitle}>Statistiques jour</Text>
               <Text style={styles.boxBullet}>- Total donations : ${totalDonations}</Text>
               <Text style={styles.boxBullet}>- Heure sur le terrain : {realTimeHMS}</Text>
@@ -174,74 +182,147 @@ export default function DashboardScreen() {
         <View style={styles.bottomNav}>
           {['Dashboard', 'wallet', 'route', 'stats', 'training'].map((screen, i) => (
               <TouchableOpacity key={i} onPress={() => navigation.navigate(screen)} style={styles.navItem}>
-                <Ionicons name={
-                  screen === 'Dashboard' ? 'home' :
-                      screen === 'wallet' ? 'wallet' :
-                          screen === 'route' ? 'map' :
-                              screen === 'stats' ? 'bar-chart' : 'book'
-                } size={24} color="#8B5CF6" />
-                <Text style={styles.navText}>{screen === 'Dashboard' ? 'Accueil' : screen.charAt(0).toUpperCase() + screen.slice(1)}</Text>
+                <Ionicons
+                    name={
+                      screen === 'Dashboard' ? 'home' :
+                          screen === 'wallet' ? 'wallet' :
+                              screen === 'route' ? 'map' :
+                                  screen === 'stats' ? 'bar-chart' : 'book'
+                    }
+                    size={24}
+                    color={screen === 'Dashboard' ? '#8B5CF6' : '#FFFFFF'}
+                />
+                <Text style={[styles.navText, screen === 'Dashboard' && { color: '#8B5CF6' }]}>
+                  {screen === 'Dashboard' ? 'Accueil' : screen.charAt(0).toUpperCase() + screen.slice(1)}
+                </Text>
               </TouchableOpacity>
+
           ))}
         </View>
+        <Modal
+            transparent
+            visible={showProfileOptions}
+            animationType="fade"
+            onRequestClose={() => setShowProfileOptions(false)}
+        >
+          <TouchableOpacity style={styles.modalOverlay} onPress={() => setShowProfileOptions(false)}>
+            <View style={styles.modalBox}>
+              <TouchableOpacity
+                  style={styles.modalOption}
+                  onPress={() => {
+                    setShowProfileOptions(false);
+                    navigation.navigate('profile');
+                  }}
+              >
+                <Text style={styles.modalText}>✏️ Modifier mon compte</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                  style={styles.modalOption}
+                  onPress={() => {
+                    setShowProfileOptions(false);
+                    handleLogout();
+                  }}
+              >
+                <Text style={[styles.modalText, { color: '#FF5E5E' }]}>🔓 Se déconnecter</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </Modal>
+
       </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F4F4F4' },
-  content: { padding: 10 },
-  header: { paddingVertical: 20, backgroundColor: '#7078DC', borderBottomLeftRadius: 30, borderBottomRightRadius: 30 },
-  headerContent: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20 },
-  avatar: { width: 65, height: 65, borderRadius: 32.5, borderWidth: 3, borderColor: '#FFF' },
-  welcome: { color: '#EEE', fontSize: 14 },
+  container: { flex: 1, backgroundColor: '#000' },
+  floatingHeader: {
+    position: 'absolute',
+    top: 20,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(28,28,30,0.95)',
+    borderRadius: 25,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 10,
+    elevation: 12,
+    zIndex: 10,
+  },
+  headerContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  avatar: { width: 55, height: 55, borderRadius: 27.5, borderWidth: 2, borderColor: '#fff' },
+  welcome: { color: '#DDD', fontSize: 14 },
   userName: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
+  logoAzirm: { width: 60, height: 60, resizeMode: 'contain' },
+  content: { padding: 10, paddingTop: 120 },
   grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-  boxPurple: {
+  boxDark: {
     width: '48%',
-    backgroundColor: '#EEE6FD',
+    backgroundColor: '#1C1C1E',
     padding: 15,
     marginBottom: 15,
     borderRadius: 12,
-    borderLeftWidth: 6,
-    borderLeftColor: '#8B5CF6',
-    elevation: 3,
   },
-  boxWhite: {
-    width: '48%',
-    backgroundColor: '#fff',
+  boxDarkFull: {
+    width: '100%',
+    backgroundColor: '#1C1C1E',
     padding: 15,
     marginBottom: 15,
     borderRadius: 12,
-    elevation: 2,
   },
-  logoAzirm: { width: 80, height: 80, resizeMode: 'contain' },
-  boxTitle: { fontWeight: 'bold', fontSize: 16, marginBottom: 8, color: '#333' },
-  boxBullet: { fontSize: 12, marginVertical: 2, color: '#555' },
+  boxTitle: { fontWeight: 'bold', fontSize: 16, marginBottom: 8, color: '#FFF' },
+  boxBullet: { fontSize: 12, marginVertical: 2, color: '#AAA' },
   agentRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 6 },
   agentAvatar: { width: 30, height: 30, borderRadius: 15, marginRight: 8 },
-  agentName: { fontSize: 13, color: '#333' },
+  agentName: { fontSize: 13, color: '#FFF' },
   trophyBorder: { borderWidth: 2, borderColor: 'gold' },
   announcement: {
     width: '100%',
-    backgroundColor: '#FFFFFF',
-    padding: 40,
+    backgroundColor: '#1C1C1E',
+    padding: 30,
     marginTop: 10,
     marginBottom: 20,
     borderRadius: 18,
     alignItems: 'center',
-    elevation: 5,
     borderColor: '#8B5CF6',
-    borderWidth: 2,
+    borderWidth: 1,
   },
-  announcementText: { fontSize: 26, fontWeight: 'bold', color: '#4B3F72' },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalBox: {
+    backgroundColor: '#1C1C1E',
+    padding: 20,
+    borderRadius: 12,
+    width: '80%',
+  },
+  modalOption: {
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#333',
+  },
+  modalText: {
+    color: '#FFF',
+    fontSize: 16,
+    textAlign: 'center',
+  },
+
+  announcementText: { fontSize: 22, fontWeight: 'bold', color: '#FFF' },
   bottomNav: {
     position: 'absolute',
     bottom: 20,
     left: 10,
     right: 10,
     flexDirection: 'row',
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#1C1C1E',
     paddingVertical: 12,
     paddingHorizontal: 20,
     borderRadius: 30,
@@ -251,5 +332,5 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   navItem: { flex: 1, alignItems: 'center' },
-  navText: { fontSize: 11, color: '#666', marginTop: 5 },
+  navText: { fontSize: 11, color: '#FFF', marginTop: 5 },
 });

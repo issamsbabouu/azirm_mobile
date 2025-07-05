@@ -67,6 +67,7 @@ const QuebecMapScreen = ({ navigation }) => {
     const [totalCollected, setTotalCollected] = useState(0);
     const [donations, setDonations] = useState([]);
     const [profileLoading, setProfileLoading] = useState(false);
+    const [showProfileOptions, setShowProfileOptions] = useState(false);
     const popupAnimation = useRef(new Animated.Value(0)).current;
     const mapRef = useRef(null);
     const { user, userName } = useAuth();
@@ -78,7 +79,13 @@ const QuebecMapScreen = ({ navigation }) => {
         }
         return true;
     };
-
+    const handleLogout = async () => {
+        await supabase.auth.signOut();
+        navigation.reset({
+            index: 0,
+            routes: [{ name: 'AuthNavigator' }],
+        });
+    };
     const fetchMissions = async () => {
         setLoading(true);
         try {
@@ -126,11 +133,9 @@ const QuebecMapScreen = ({ navigation }) => {
                     lat < -90 || lat > 90 ||
                     lng < -180 || lng > 180
                 ) {
-                    console.warn(`❌ Coordonnées invalides ou hors limite pour: ${addr.address} → (${lat}, ${lng})`);
+                    console.warn(`❌ Coordonnées invalides pour: ${addr.address} → (${lat}, ${lng})`);
                     return null;
                 }
-
-                console.log(`✅ Adresse OK: ${addr.address} → https://www.google.com/maps?q=${lat},${lng}`);
 
                 return {
                     ...addr,
@@ -142,19 +147,37 @@ const QuebecMapScreen = ({ navigation }) => {
                 };
             }).filter(addr => addr !== null);
 
-            console.log("Missions traitées:", processed); // Vérifier les données traitées
+            // 🔁 Supprimer les missions en absent_3 depuis plus de 2 jours
+            const now = new Date();
+            const validMissions = [];
 
-            setMissions(processed);
+            for (let addr of processed) {
+                if (addr.status === 'absent_3') {
+                    const updatedAt = new Date(addr.updated_at);
+                    const diffDays = (now - updatedAt) / (1000 * 60 * 60 * 24);
+                    if (diffDays >= 2) {
+                        await supabase
+                            .from('donor_addresses')
+                            .delete()
+                            .eq('id', addr.id);
+                        continue;
+                    }
+                }
+                validMissions.push(addr);
+            }
 
-            // Calculer les compteurs de statut
+            setMissions(validMissions);
+
             const counts = {
                 'non visité': 0,
                 'visité et accepté': 0,
                 'visité et refusé': 0,
-                'absent': 0
+                'absent_1': 0,
+                'absent_2': 0,
+                'absent_3': 0
             };
 
-            processed.forEach(addr => {
+            validMissions.forEach(addr => {
                 const status = addr.status || 'non visité';
                 counts[status] = (counts[status] || 0) + 1;
             });
@@ -168,6 +191,7 @@ const QuebecMapScreen = ({ navigation }) => {
             setLoading(false);
         }
     };
+
     useEffect(() => {
         if (user?.id) {
             hasCenteredMapRef.current = false;
@@ -312,7 +336,6 @@ const QuebecMapScreen = ({ navigation }) => {
             setIsRecording(true);
             console.log("🎙️ Démarré:", path);
         } catch (error) {
-            console.error("❌ startRecording:", error);
             setRecordPath('');
             setIsRecording(false);
         }
@@ -535,7 +558,7 @@ const QuebecMapScreen = ({ navigation }) => {
                 return (
                     <View>
                         <Text>Statut de la visite</Text>
-                        {['visité et accepté','visité et refusé','absent'].map(s => (
+                        {['visité et accepté','visité et refusé'].map(s => (
                             <TouchableOpacity
                                 key={s}
                                 onPress={() => setVisitData({ ...visitData, status: s })}
@@ -545,6 +568,37 @@ const QuebecMapScreen = ({ navigation }) => {
                                 </Text>
                             </TouchableOpacity>
                         ))}
+
+                        <TouchableOpacity
+                            onPress={() => {
+                                const current = recordAddress?.status || 'non visité';
+                                let nextAbsent = null;
+
+                                switch (current) {
+                                    case 'absent_1':
+                                        nextAbsent = 'absent_2';
+                                        break;
+                                    case 'absent_2':
+                                        nextAbsent = 'absent_3';
+                                        break;
+                                    case 'absent_3':
+                                        nextAbsent = 'absent_4';
+                                        break;
+                                    default:
+                                        nextAbsent = 'absent_1';
+                                }
+
+                                setVisitData({ ...visitData, status: nextAbsent });
+                            }}
+                            style={[
+                                styles.optionButton,
+                                visitData.status?.startsWith('absent') && styles.optionButtonActive
+                            ]}
+                        >
+                            <Text style={visitData.status?.startsWith('absent') ? styles.optionTextActive : styles.optionText}>
+                                {visitData.status?.startsWith('absent') ? visitData.status.replace('_', ' ').toUpperCase() : 'Absent'}
+                            </Text>
+                        </TouchableOpacity>
                     </View>
                 );
             case 2:
@@ -671,17 +725,28 @@ const QuebecMapScreen = ({ navigation }) => {
             setCurrentPage(currentPage - 1);
         }
     };
-
     const submitVisitRecord = async () => {
         try {
             if (!recordAddress?.id) {
                 Alert.alert('Erreur', 'Adresse introuvable.');
                 return;
             }
+
+            const statusMapping = {
+                'absent_1': 'absent_1',
+                'absent_2': 'absent_2',
+                'absent_3': 'absent_3',
+                'absent_4': 'absent_4',
+                'visité et accepté': 'visité et accepté',
+                'visité et refusé': 'visité et refusé'
+            };
+            const mappedStatus = statusMapping[visitData.status] || visitData.status;
+
+
             const { error: addrError } = await supabase
                 .from('donor_addresses')
                 .update({
-                    status: visitData.status,
+                    status: mappedStatus,
                     updated_at: new Date().toISOString()
                 })
                 .eq('id', recordAddress.id);
@@ -690,7 +755,9 @@ const QuebecMapScreen = ({ navigation }) => {
                 Alert.alert('Erreur', `Impossible de mettre à jour le statut : ${addrError.message}`);
                 return;
             }
-            if (visitData.status === 'visité et accepté') {
+
+            // Enregistrer donation si accepté
+            if (mappedStatus === 'visité et accepté') {
                 const amount = parseFloat(visitData.donationAmount);
                 if (!visitData.contactPerson || !visitData.email || isNaN(amount) || amount <= 0) {
                     Alert.alert('Erreur', 'Nom, email et montant valides obligatoires.');
@@ -704,7 +771,7 @@ const QuebecMapScreen = ({ navigation }) => {
                     .single();
 
                 if (collectorError || !collector) {
-                    Alert.alert('Erreur', 'Impossible de récupérer les informations du collecteur.');
+                    Alert.alert('Erreur', 'Impossible de récupérer les infos collecteur.');
                     return;
                 }
 
@@ -724,13 +791,10 @@ const QuebecMapScreen = ({ navigation }) => {
                 if (donationError) {
                     Alert.alert('Attention', 'Donation non enregistrée malgré la mise à jour du statut.');
                 } else {
-                    const newTotalCollected = (collector.total_collected || 0) + amount;
-
+                    const newTotal = (collector.total_collected || 0) + amount;
                     await supabase
                         .from('collectors')
-                        .update({
-                            total_collected: newTotalCollected
-                        })
+                        .update({ total_collected: newTotal })
                         .eq('id', collector.id);
                 }
             }
@@ -744,6 +808,7 @@ const QuebecMapScreen = ({ navigation }) => {
         }
         await fetchTodaysCommissions();
     };
+
     useEffect(() => {
         if (missions.length > 0 && mapRef.current) {
             const latitudes = missions.map(m => m.location_lat);
@@ -778,7 +843,10 @@ const QuebecMapScreen = ({ navigation }) => {
         switch(status){
             case 'visité et accepté': return '#7ED321';
             case 'visité et refusé':  return '#D0021B';
-            case 'absent':            return '#F5A623';
+            case 'absent_1': return '#CCCCCC';
+            case 'absent_2': return '#FFD700';
+            case 'absent_3': return '#FFA500';
+            case 'absent_4': return '#AAAAAA';
             default:                  return 'blue';
         }
     };
@@ -1018,11 +1086,12 @@ const QuebecMapScreen = ({ navigation }) => {
                 {renderNavItem('menu-book', 'Formation', false, () => navigation.navigate('training'))}
                 <TouchableOpacity
                     style={styles.profileNavItem}
-                    onPress={openProfileModal}
+                    onPress={() => setShowProfileOptions(true)}
                 >
                     <Image source={{ uri: userProfileImage }} style={styles.navAvatar} />
                     <Text style={styles.navText}>Profil</Text>
                 </TouchableOpacity>
+
             </View>
 
             <TouchableOpacity
@@ -1101,11 +1170,63 @@ const QuebecMapScreen = ({ navigation }) => {
                     </View>
                 </View>
             </Modal>
+            <Modal
+                transparent
+                visible={showProfileOptions}
+                animationType="fade"
+                onRequestClose={() => setShowProfileOptions(false)}
+            >
+                <TouchableOpacity style={styles.modalOverlayy} onPress={() => setShowProfileOptions(false)}>
+                    <View style={styles.modalBox}>
+                        <TouchableOpacity
+                            style={styles.modalOption}
+                            onPress={() => {
+                                setShowProfileOptions(false);
+                                navigation.navigate('profile');
+                            }}
+                        >
+                            <Text style={styles.modalText}>✏️ Modifier mon compte</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                            style={styles.modalOption}
+                            onPress={() => {
+                                setShowProfileOptions(false);
+                                handleLogout();
+                            }}
+                        >
+                            <Text style={[styles.modalText, { color: '#FF5E5E' }]}>🔓 Se déconnecter</Text>
+                        </TouchableOpacity>
+                    </View>
+                </TouchableOpacity>
+            </Modal>
+
         </View>
     );
 };
 
 const styles = StyleSheet.create({
+    modalOverlayy: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    modalBox: {
+        backgroundColor: '#1C1C1E',
+        padding: 20,
+        borderRadius: 12,
+        width: '80%',
+    },
+    modalOption: {
+        paddingVertical: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: '#333',
+    },
+    modalText: {
+        color: '#FFF',
+        fontSize: 16,
+        textAlign: 'center',
+    },
     markerCircle: {
         width: 30,
         height: 30,
@@ -1151,20 +1272,17 @@ const styles = StyleSheet.create({
     bottomNav: {
         position: 'absolute',
         bottom: 20,
-        left: 20,
-        right: 20,
+        left: 10,
+        right: 10,
         flexDirection: 'row',
-        backgroundColor: 'white',
-        paddingVertical: 15,
+        backgroundColor: '#1C1C1E',
+        paddingVertical: 12,
         paddingHorizontal: 20,
-        borderRadius: 25,
+        borderRadius: 30,
         shadowColor: '#000',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.15,
+        shadowOpacity: 0.1,
         shadowRadius: 8,
-        elevation: 12,
-        borderWidth: 1,
-        borderColor: '#f0f0f0',
+        elevation: 10
     },
     navItem: {
         flex: 1,

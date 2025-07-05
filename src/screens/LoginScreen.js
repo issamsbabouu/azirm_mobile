@@ -1,16 +1,9 @@
+// LoginScreen.jsx - version sombre harmonisée
 import React, { useState, useEffect } from 'react';
 import {
-  View,
-  Text,
-  Image,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  ActivityIndicator,
-  Alert,
+  View, Text, Image, TextInput, TouchableOpacity,
+  StyleSheet, KeyboardAvoidingView, Platform,
+  ScrollView, ActivityIndicator, Alert,
 } from 'react-native';
 import { supabase } from '../supabase';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,6 +11,7 @@ import { useAuth } from '../context/AuthContext';
 import { FontAwesome5 } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
 const primaryColor = '#7078DC';
 const secondaryColor = '#8F71C1';
 
@@ -34,9 +28,8 @@ const LoginScreen = () => {
     if (isAuthenticated && user) {
       navigation.replace('Dashboard');
     }
-  }, [isAuthenticated, user, userName, navigation]);
+  }, [isAuthenticated, user]);
 
-  // Charger les données sauvegardées au démarrage
   useEffect(() => {
     const loadSavedCredentials = async () => {
       try {
@@ -54,10 +47,7 @@ const LoginScreen = () => {
     loadSavedCredentials();
   }, []);
 
-  const validateEmail = (email) => {
-    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    return re.test(email);
-  };
+  const validateEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
   const handleLogin = async () => {
     if (!email.trim() || !validateEmail(email.trim()) || !password) {
@@ -65,7 +55,7 @@ const LoginScreen = () => {
       return;
     }
     try {
-      const result = await login(email.trim(), password);
+      await login(email.trim(), password);
       if (rememberMe) {
         await AsyncStorage.setItem('email', email.trim());
         await AsyncStorage.setItem('password', password);
@@ -83,16 +73,12 @@ const LoginScreen = () => {
     }
   };
 
-  const handleRememberMe = () => {
-    setRememberMe(!rememberMe);
-  };
-
   return (
       <SafeAreaView style={styles.container}>
         <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.keyboardView}>
-          <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
             <View style={styles.logoContainer}>
-              <Image source={require('../../assets/logo.png')} style={styles.logo} resizeMode="contain" />
+              <Image source={require('../../assets/logo_whte.png')} style={styles.logo} resizeMode="contain" />
               <Text style={styles.welcomeText}>Bienvenue !</Text>
               <Text style={styles.subtitleText}>Connectez-vous pour continuer</Text>
             </View>
@@ -103,14 +89,11 @@ const LoginScreen = () => {
                 <TextInput
                     style={styles.input}
                     placeholder="Adresse email"
-                    placeholderTextColor="#A0A0A0"
+                    placeholderTextColor="#888"
                     value={email}
                     onChangeText={setEmail}
                     keyboardType="email-address"
                     autoCapitalize="none"
-                    autoCorrect={false}
-                    autoComplete="email"
-                    editable={!isLoading}
                 />
               </View>
               {!validateEmail(email) && email.length > 0 && (
@@ -122,12 +105,10 @@ const LoginScreen = () => {
                 <TextInput
                     style={styles.input}
                     placeholder="Mot de passe"
-                    placeholderTextColor="#A0A0A0"
+                    placeholderTextColor="#888"
                     value={password}
                     onChangeText={setPassword}
                     secureTextEntry={!passwordVisible}
-                    autoComplete="password"
-                    editable={!isLoading}
                 />
                 <TouchableOpacity onPress={() => setPasswordVisible(!passwordVisible)}>
                   <FontAwesome5 name={passwordVisible ? "eye-slash" : "eye"} size={16} color="#A0A0A0" />
@@ -135,7 +116,7 @@ const LoginScreen = () => {
               </View>
 
               <View style={styles.options}>
-                <TouchableOpacity style={styles.rememberMe} onPress={handleRememberMe} disabled={isLoading}>
+                <TouchableOpacity style={styles.rememberMe} onPress={() => setRememberMe(!rememberMe)}>
                   <View style={[styles.checkbox, rememberMe && styles.checkboxChecked]}>
                     {rememberMe && <FontAwesome5 name="check" size={10} color="white" />}
                   </View>
@@ -144,15 +125,14 @@ const LoginScreen = () => {
               </View>
 
               <TouchableOpacity
-                  style={[styles.loginButton, (isLoading || !email.trim() || !password || !validateEmail(email.trim())) && styles.buttonDisabled]}
+                  style={[styles.loginButton, (!email.trim() || !password || !validateEmail(email.trim())) && styles.buttonDisabled]}
                   onPress={handleLogin}
-                  disabled={isLoading || !email.trim() || !password || !validateEmail(email.trim())}
-                  activeOpacity={0.8}
+                  disabled={!email.trim() || !password || !validateEmail(email.trim())}
               >
                 {isLoading ? (
                     <View style={styles.loadingContainer}>
                       <ActivityIndicator color="white" size="small" />
-                      <Text style={[styles.buttonText, { marginLeft: 10 }]}>Connexion en cours...</Text>
+                      <Text style={[styles.buttonText, { marginLeft: 10 }]}>Connexion...</Text>
                     </View>
                 ) : (
                     <>
@@ -164,7 +144,7 @@ const LoginScreen = () => {
             </View>
 
             <View style={styles.helpContainer}>
-              <TouchableOpacity style={styles.helpButton} onPress={() => setHelpVisible(true)} disabled={isLoading}>
+              <TouchableOpacity style={styles.helpButton} onPress={() => setHelpVisible(true)}>
                 <FontAwesome5 name="question-circle" size={16} color={primaryColor} />
                 <Text style={styles.helpText}>Besoin d'aide ?</Text>
               </TouchableOpacity>
@@ -172,7 +152,6 @@ const LoginScreen = () => {
           </ScrollView>
         </KeyboardAvoidingView>
 
-        {/* MODALE D'AIDE */}
         {helpVisible && (
             <View style={styles.modalOverlay}>
               <View style={styles.modalContent}>
@@ -180,7 +159,7 @@ const LoginScreen = () => {
                 <Text style={styles.modalTitle}>Aide à la connexion</Text>
                 <Text style={styles.modalText}>
                   Si vous rencontrez des difficultés :{"\n\n"}
-                  • Vérifiez votre  email et mot de passe{"\n"}
+                  • Vérifiez votre email et mot de passe{"\n"}
                   • Assurez-vous d'avoir une connexion internet{"\n"}
                   • Contactez le support si le problème persiste
                 </Text>
@@ -194,34 +173,27 @@ const LoginScreen = () => {
   );
 };
 
-// Styles AZIRM 3.0
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: 'white' },
+  container: { flex: 1, backgroundColor: '#000' },
   keyboardView: { flex: 1 },
   scrollContent: { flexGrow: 1, justifyContent: 'center', padding: 20, paddingBottom: 40 },
   logoContainer: { alignItems: 'center', marginBottom: 40 },
   logo: { width: 200, height: 100, marginBottom: 16 },
-  welcomeText: { fontSize: 24, fontWeight: 'bold', color: '#1F2937', marginBottom: 4 },
-  subtitleText: { fontSize: 16, color: '#6B7280', textAlign: 'center' },
+  welcomeText: { fontSize: 24, fontWeight: 'bold', color: '#FFF', marginBottom: 4 },
+  subtitleText: { fontSize: 16, color: '#A1A1AA', textAlign: 'center' },
   loginCard: {
-    backgroundColor: 'white',
-    borderRadius: 16,
-    padding: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 5,
-    marginBottom: 20,
+    backgroundColor: '#1C1C1E', borderRadius: 16, padding: 24,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1,
+    shadowRadius: 8, elevation: 5, marginBottom: 20,
   },
   inputContainer: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: '#E5E7EB',
-    borderRadius: 12, paddingHorizontal: 16, marginBottom: 4, minHeight: 50,
+    flexDirection: 'row', alignItems: 'center', backgroundColor: '#2A2A2E',
+    borderWidth: 1, borderColor: '#4B4B4D', borderRadius: 12,
+    paddingHorizontal: 16, marginBottom: 4, minHeight: 50,
   },
-  inputError: { borderColor: '#EF4444', backgroundColor: '#FEF2F2' },
+  inputError: { borderColor: '#EF4444', backgroundColor: '#3A1A1A' },
   icon: { marginRight: 12 },
-  input: { flex: 1, height: 50, color: '#1F2937', fontSize: 16 },
+  input: { flex: 1, height: 50, color: '#FFF', fontSize: 16 },
   errorText: { color: '#EF4444', fontSize: 12, marginBottom: 12, marginLeft: 4 },
   options: { flexDirection: 'row', justifyContent: 'flex-start', marginBottom: 24, marginTop: 12 },
   rememberMe: { flexDirection: 'row', alignItems: 'center' },
@@ -230,7 +202,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center', alignItems: 'center', marginRight: 8,
   },
   checkboxChecked: { backgroundColor: secondaryColor, borderColor: secondaryColor },
-  rememberMeText: { color: '#6B7280', fontSize: 14 },
+  rememberMeText: { color: '#CCC', fontSize: 14 },
   loginButton: {
     backgroundColor: primaryColor, borderRadius: 12, height: 50,
     flexDirection: 'row', justifyContent: 'center', alignItems: 'center',
@@ -242,18 +214,18 @@ const styles = StyleSheet.create({
   loadingContainer: { flexDirection: 'row', alignItems: 'center' },
   helpContainer: { alignItems: 'center', marginTop: 10 },
   helpButton: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, paddingHorizontal: 12 },
-  helpText: { color: primaryColor, fontSize: 14, marginLeft: 8, fontWeight: '500' },
+  helpText: { color: secondaryColor, fontSize: 14, marginLeft: 8, fontWeight: '500' },
   modalOverlay: {
     position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', alignItems: 'center', zIndex: 999,
   },
   modalContent: {
-    backgroundColor: 'white', borderRadius: 20, padding: 24, width: '85%',
+    backgroundColor: '#1C1C1E', borderRadius: 20, padding: 24, width: '85%',
     alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.25, shadowRadius: 4, elevation: 5,
   },
-  modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#1F2937', marginBottom: 12, textAlign: 'center' },
-  modalText: { fontSize: 16, color: '#4B5563', textAlign: 'left', marginBottom: 20 },
+  modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#FFF', marginBottom: 12, textAlign: 'center' },
+  modalText: { fontSize: 16, color: '#DDD', textAlign: 'left', marginBottom: 20 },
   closeButton: { backgroundColor: primaryColor, paddingVertical: 10, paddingHorizontal: 30, borderRadius: 8 },
   closeButtonText: { color: 'white', fontSize: 16, fontWeight: '600' },
 });

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TextInput, TouchableOpacity, Image, StyleSheet, Alert, ActivityIndicator, ScrollView, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons, FontAwesome } from '@expo/vector-icons';
+import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../supabase';
 import { useAuth } from '../context/AuthContext';
@@ -160,13 +160,13 @@ export default function EditProfileScreen() {
 }
 
 const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: 'white' },
+    container: { flex: 1, backgroundColor: '#121212' },
     avatarContainer: { marginTop: 40, alignItems: 'center' },
-    avatar: { width: 130, height: 130, borderRadius: 65, borderWidth: 3, borderColor: '#ccc' },
-    cameraIcon: { position: 'absolute', bottom: 5, right: width / 2 - 90, backgroundColor: '#fff', borderRadius: 15, padding: 5 },
+    avatar: { width: 130, height: 130, borderRadius: 65, borderWidth: 3, borderColor: '#333' },
+    cameraIcon: { position: 'absolute', bottom: 5, right: width / 2 - 90, backgroundColor: '#1C1C1E', borderRadius: 15, padding: 5 },
     form: { marginTop: 40, paddingHorizontal: 20 },
-    label: { fontWeight: 'bold', marginBottom: 5 },
-    input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 10, padding: 10, marginBottom: 15 },
+    label: { fontWeight: 'bold', marginBottom: 5, color: '#FFF' },
+    input: { borderWidth: 1, borderColor: '#444', backgroundColor: '#1C1C1E', color: '#FFF', borderRadius: 10, padding: 10, marginBottom: 15 },
     saveButton: { backgroundColor: '#7078DC', padding: 15, borderRadius: 10, alignItems: 'center' },
     saveButtonText: { color: 'white', fontWeight: 'bold' },
     bottomNav: {
@@ -175,7 +175,7 @@ const styles = StyleSheet.create({
         left: 20,
         right: 20,
         flexDirection: 'row',
-        backgroundColor: '#FFFFFF',
+        backgroundColor: '#1C1C1E',
         paddingVertical: 12,
         paddingHorizontal: 20,
         borderRadius: 30,
@@ -186,16 +186,6 @@ const styles = StyleSheet.create({
         zIndex: 999
     },
     navItem: { flex: 1, alignItems: 'center', paddingVertical: 5 },
-    navText: { fontSize: 11, color: '#666', marginTop: 5 },
-    activeNavText: { color: '#7078DC' },
-    addButtonNav: {
-        position: 'absolute',
-        alignSelf: 'center',
-        bottom: 20,
-        backgroundColor: '#7078DC',
-        borderRadius: 35,
-        padding: 15,
-        elevation: 5,
-        zIndex: 1000
-    }
+    navText: { fontSize: 11, color: '#CCC', marginTop: 5 },
+    activeNavText: { color: '#7078DC' }
 });

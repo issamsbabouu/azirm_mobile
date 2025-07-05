@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
     View, Text, StyleSheet, ScrollView, TouchableOpacity, Image,
-    SafeAreaView, Dimensions, ActivityIndicator
+    SafeAreaView, Dimensions, ActivityIndicator,Modal
 } from 'react-native';
 import { useAuth } from '../context/AuthContext';
 import { MaterialIcons } from '@expo/vector-icons';
@@ -15,12 +15,14 @@ const DonationWalletApp = () => {
     const { user, userName } = useAuth();
     const [userProfileImage, setUserProfileImage] = useState('');
     const [walletBalance, setWalletBalance] = useState(0);
-    const [totalCollected, setTotalCollected] = useState(0);
-    const [totalCommission, setTotalCommission] = useState(0); // ✅ Bien initialisé à 0
-    const [donations, setDonations] = useState([]);
-    const [loading, setLoading] = useState(true);
+    const [courant, setCourant] = useState(350);
+    const [caution, setCaution] = useState(120);
+    const [epargne, setEpargne] = useState(432);
+    const [objectifEpargne, setObjectifEpargne] = useState(1200);
+    const [points, setPoints] = useState(1250);
     const navigation = useNavigation();
-
+    const [loading, setLoading] = useState(true);
+    const [showProfileOptions, setShowProfileOptions] = useState(false);
     useEffect(() => {
         if (user) fetchAllData();
     }, [user]);
@@ -28,44 +30,42 @@ const DonationWalletApp = () => {
     async function fetchAllData() {
         setLoading(true);
         try {
-            const { data: userData, error: userError } = await supabase
+            const { data: userData } = await supabase
                 .from('users')
                 .select('profile_image')
                 .eq('id', user.id)
                 .single();
-            if (userError) throw userError;
             setUserProfileImage(userData?.profile_image || 'https://via.placeholder.com/150');
 
-            const { data: collectorData, error: collectorError } = await supabase
+            const { data: collectorData } = await supabase
                 .from('collectors')
-                .select('id, wallet_balance, total_collected, commission')
+                .select('*')
                 .eq('user_id', user.id)
                 .single();
-            if (collectorError) throw collectorError;
 
-            const collectorId = collectorData.id;
-            setWalletBalance(collectorData.wallet_balance || 0);
-            setTotalCollected(collectorData.total_collected || 0);
-            setTotalCommission(Number(collectorData.commission) || 0); // ✅ Sécurisé
+            setWalletBalance((collectorData?.wallet_balance || 0));
+            setPoints(collectorData?.nova_points || 1250);
+            setCourant(Number(collectorData?.current) || 0);
+            setCaution(Number(collectorData?.caution) || 0);
+            setEpargne(Number(collectorData?.savings) || 0);
 
-            const { data: donationsData, error: donationsError } = await supabase
-                .from('donations')
-                .select('*')
-                .eq('collector_id', collectorId)
-                .order('created_at', { ascending: false });
-            if (donationsError) throw donationsError;
-
-            setDonations(donationsData || []);
-        } catch (err) {
-            console.error('Erreur lors du chargement:', err);
+        } catch (e) {
+            console.error("Erreur de chargement:", e);
         } finally {
             setLoading(false);
         }
     }
+    const handleLogout = async () => {
+        await supabase.auth.signOut();
+        navigation.reset({
+            index: 0,
+            routes: [{ name: 'AuthNavigator' }],
+        });
+    };
 
-    async function handleRefresh() {
-        fetchAllData();
-    }
+    const total = (Number(courant) || 0) + (Number(caution) || 0) + (Number(epargne) || 0);
+    const progress = Math.min(epargne / objectifEpargne, 1);
+    const progressPercentage = Math.round(progress * 100);
 
     function renderNavItem(iconName, label, isActive, onPress) {
         return (
@@ -86,84 +86,235 @@ const DonationWalletApp = () => {
 
     return (
         <SafeAreaView style={styles.container}>
-            <LinearGradient colors={['#7078DC', '#8F71C1']} style={styles.header}>
-                <View style={styles.headerContent}>
-                    <TouchableOpacity>
-                        <Image source={{ uri: userProfileImage }} style={styles.avatar} />
+            {/* ✅ HEADER */}
+            <View style={styles.floatingHeader}>
+                <TouchableOpacity onPress={() => setShowProfileOptions(true)}>
+                    <Image source={{ uri: userProfileImage }} style={styles.avatar} />
+                </TouchableOpacity>
+                <View>
+                    <Text style={styles.userName}>{userName || 'Utilisateur'}</Text>
+                </View>
+                <Image source={require('../../assets/logo_whte.png')} style={styles.logoAzirm} />
+            </View>
+
+            {/* ✅ CONTENU */}
+            <ScrollView contentContainerStyle={styles.content}>
+                <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Solde global</Text>
+                    <Text style={styles.totalAmount}>${total.toFixed(2).replace('.', ',')}</Text>
+                </View>
+
+                <View style={styles.row}>
+                    <View style={styles.smallCard}>
+                        <Text style={styles.smallCardTitle}>Courant</Text>
+                        <Text style={styles.smallCardAmount}>${courant.toFixed(2).replace('.', ',')}</Text>
+                    </View>
+                    <View style={styles.smallCard}>
+                        <Text style={styles.smallCardTitle}>Caution</Text>
+                        <Text style={styles.smallCardAmount}>${caution.toFixed(2).replace('.', ',')}</Text>
+                    </View>
+                    <View style={styles.smallCard}>
+                        <Text style={styles.smallCardTitle}>Épargne</Text>
+                        <Text style={styles.smallCardAmount}>${epargne.toFixed(2).replace('.', ',')}</Text>
+                    </View>
+                </View>
+
+                <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Objectif épargne</Text>
+                    <View style={styles.progressBarContainer}>
+                        <View style={[styles.progressBar, { width: `${progressPercentage}%` }]} />
+                    </View>
+                    <View style={styles.progressTextRow}>
+                        <Text style={styles.progressText}>{progressPercentage}% atteint</Text>
+                        <Text style={styles.progressText}>{epargne} sur {objectifEpargne}</Text>
+                    </View>
+                </View>
+
+                <View style={styles.row}>
+                    <TouchableOpacity style={styles.button}>
+                        <Text style={styles.buttonText}>Transférer</Text>
                     </TouchableOpacity>
-                    <View>
-                        <Text style={styles.welcomeText}>Bienvenue</Text>
-                        <Text style={styles.userName}>{userName || 'Utilisateur'}</Text>
-                    </View>
-                    <Image source={require('../../assets/logo_whte.png')} style={styles.logoAzirm} />
-                </View>
-            </LinearGradient>
-
-            <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
-                <View style={styles.cardRow}>
-                    <View style={[styles.balanceCard, styles.halfCard]}>
-                        <Text style={styles.cardTitle}>Total collecté</Text>
-                        <Text style={styles.balanceAmount}>${totalCollected.toFixed(2)}</Text>
-                    </View>
+                    <TouchableOpacity style={styles.button}>
+                        <Text style={styles.buttonText}>Historique</Text>
+                    </TouchableOpacity>
                 </View>
 
-                {}
-                <View style={styles.balanceCard}>
-                    <Text style={styles.cardTitle}>Total des commissions</Text>
-                    <Text style={styles.balanceAmount}>${(totalCommission || 0).toFixed(2)}</Text>
-                </View>
-
-                <View style={styles.section}>
-                    <Text style={styles.sectionTitle}>Mes Donations</Text>
-                    {donations.length === 0 ? (
-                        <Text style={styles.noDonationText}>Aucune donation encore.</Text>
-                    ) : (
-                        donations.map(donation => (
-                            <View key={donation.id} style={styles.donationItem}>
-                                <Text style={styles.donationAmount}>+ ${donation.amount.toFixed(2)}</Text>
-                                <Text style={styles.donationDate}>{new Date(donation.created_at).toLocaleDateString()}</Text>
-                            </View>
-                        ))
-                    )}
+                <View style={styles.pointsSection}>
+                    <Text style={styles.pointsLabel}>Points</Text>
+                    <Text style={styles.pointsValue}>{points.toLocaleString('fr-FR')} pts</Text>
                 </View>
             </ScrollView>
 
+            {/* ✅ BOTTOM NAV */}
             <View style={styles.bottomNav}>
                 {renderNavItem('home', 'Accueil', false, () => navigation.navigate('Dashboard'))}
                 {renderNavItem('account-balance-wallet', 'Wallet', true, () => navigation.navigate('wallet'))}
                 {renderNavItem('place', 'Missions', false, () => navigation.navigate('route'))}
                 {renderNavItem('bar-chart', 'Stats', false, () => navigation.navigate('stats'))}
-                {renderNavItem('menu-book', 'Formation', false, () => navigation.navigate('training'))}
+                {renderNavItem('menu-book', 'Formations', false, () => navigation.navigate('training'))}
             </View>
+            <Modal
+                transparent
+                visible={showProfileOptions}
+                animationType="fade"
+                onRequestClose={() => setShowProfileOptions(false)}
+            >
+                <TouchableOpacity style={styles.modalOverlay} onPress={() => setShowProfileOptions(false)}>
+                    <View style={styles.modalBox}>
+                        <TouchableOpacity
+                            style={styles.modalOption}
+                            onPress={() => {
+                                setShowProfileOptions(false);
+                                navigation.navigate('profile');
+                            }}
+                        >
+                            <Text style={styles.modalText}>✏️ Modifier mon compte</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                            style={styles.modalOption}
+                            onPress={() => {
+                                setShowProfileOptions(false);
+                                handleLogout();
+                            }}
+                        >
+                            <Text style={[styles.modalText, { color: '#FF5E5E' }]}>🔓 Se déconnecter</Text>
+                        </TouchableOpacity>
+                    </View>
+                </TouchableOpacity>
+            </Modal>
+
         </SafeAreaView>
     );
 };
 
 const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: '#f8f9fa' },
-    header: { paddingVertical: 20, backgroundColor: '#7078DC', borderBottomLeftRadius: 30, borderBottomRightRadius: 30 },
+    container: { flex: 1, backgroundColor: '#000' },
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    modalBox: {
+        backgroundColor: '#1C1C1E',
+        padding: 20,
+        borderRadius: 12,
+        width: '80%',
+    },
+    modalOption: {
+        paddingVertical: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: '#333',
+    },
+    modalText: {
+        color: '#FFF',
+        fontSize: 16,
+        textAlign: 'center',
+    },
+    floatingHeader: {
+        position: 'absolute',
+        top: 20,
+        left: 10,
+        right: 10,
+        backgroundColor: 'rgba(28,28,30,0.95)',
+        borderRadius: 25,
+        paddingVertical: 14,
+        paddingHorizontal: 20,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        shadowColor: '#000',
+        shadowOpacity: 0.2,
+        shadowRadius: 10,
+        elevation: 12,
+        zIndex: 999
+    },
+    logoAzirm: {
+        width: 60,
+        height: 60,
+        resizeMode: 'contain'
+    },
+    userName:{
+        color:'white',
+        fontSize: 20,
+        fontWeight: 'italic',
+    },
+    content: {
+        padding: 20,
+        paddingTop: 120
+    },
     headerContent: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20 },
     avatar: { width: 65, height: 65, borderRadius: 32.5, borderWidth: 3, borderColor: '#FFF' },
-    logoAzirm: { width: 80, height: 80, resizeMode: 'contain' },
-    welcomeText: { color: '#D1C4E9', fontSize: 15 },
-    userName: { fontWeight: 'bold', fontSize: 24, color: '#FFF' },
-    content: { flex: 1, padding: 20 },
-    balanceCard: { backgroundColor: '#fff', padding: 20, borderRadius: 15, marginBottom: 10, elevation: 5 },
-    balanceHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-    cardTitle: { fontSize: 16, fontWeight: 'bold', color: '#555' },
-    balanceAmount: { fontSize: 28, fontWeight: 'bold', color: '#4B3F72' },
-    section: { marginTop: 20 },
-    sectionTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 10, color: '#333' },
-    donationItem: { backgroundColor: '#fff', padding: 15, borderRadius: 10, marginBottom: 10, elevation: 3, flexDirection: 'row', justifyContent: 'space-between' },
-    donationAmount: { fontSize: 16, fontWeight: 'bold', color: '#10B981' },
-    donationDate: { fontSize: 14, color: '#555' },
-    noDonationText: { fontSize: 14, color: '#999', fontStyle: 'italic' },
-    bottomNav: { position: 'absolute', bottom: 20, left: 10, right: 10, flexDirection: 'row', backgroundColor: '#FFFFFF', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 30, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 8, elevation: 10 },
+    card: {
+        backgroundColor: '#1C1C1E',
+        borderRadius: 12,
+        padding: 20,
+        marginBottom: 16
+    },
+    cardTitle: { color: '#fff', fontSize: 16, marginBottom: 10 },
+    totalAmount: { color: '#fff', fontSize: 32, fontWeight: 'bold' },
+
+    row: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
+    smallCard: {
+        backgroundColor: '#1C1C1E',
+        borderRadius: 12,
+        padding: 16,
+        width: '31%'
+    },
+    smallCardTitle: { color: '#fff', fontSize: 14 },
+    smallCardAmount: { color: '#fff', fontWeight: 'bold', fontSize: 16, marginTop: 8 },
+
+    progressBarContainer: {
+        backgroundColor: '#3A3A3C',
+        height: 10,
+        borderRadius: 10,
+        marginTop: 10,
+        overflow: 'hidden'
+    },
+    progressBar: {
+        height: 10,
+        backgroundColor: '#FF5E3A',
+        borderRadius: 10
+    },
+    progressTextRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginTop: 10
+    },
+    progressText: { color: '#fff' },
+
+    button: {
+        flex: 1,
+        backgroundColor: '#1C1C1E',
+        paddingVertical: 14,
+        marginHorizontal: 5,
+        borderRadius: 12,
+        alignItems: 'center'
+    },
+    buttonText: { color: '#fff', fontWeight: '600' },
+
+    pointsSection: { marginTop: 30 },
+    pointsLabel: { color: '#FF3B30', fontSize: 16 },
+    pointsValue: { color: '#fff', fontSize: 28, fontWeight: 'bold', marginTop: 5 },
+
+    bottomNav: {
+        position: 'absolute',
+        bottom: 20,
+        left: 10,
+        right: 10,
+        flexDirection: 'row',
+        backgroundColor: '#1C1C1E',
+        paddingVertical: 12,
+        paddingHorizontal: 20,
+        borderRadius: 30,
+        shadowColor: '#000',
+        shadowOpacity: 0.1,
+        shadowRadius: 8,
+        elevation: 10
+    },
     navItem: { flex: 1, alignItems: 'center' },
     navText: { fontSize: 11, color: '#666', marginTop: 5 },
-    activeNavText: { color: '#7078DC' },
-    cardRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20 },
-    halfCard: { flex: 1, marginHorizontal: 5 }
+    activeNavText: { color: '#7078DC' }
 });
 
 export default DonationWalletApp;
