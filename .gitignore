@@ -1,37 +1,66 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# 1) Compléter .gitignore pour éviter de re-tracker des fichiers lourds
+cat > .gitignore <<'EOF'
+# Android / React Native
+android/**/build/
+android/**/outputs/
+android/**/intermediates/
+android/**/obj/
+*.apk
+*.aab
 
-# dependencies
+# iOS
+ios/build/
+ios/DerivedData/
+
+# JS
 node_modules/
 
-# Expo
+# Expo / macOS
 .expo/
-dist/
-web-build/
-expo-env.d.ts
-
-# Native
-.kotlin/
-*.orig.*
-*.jks
-*.p8
-*.p12
-*.key
-*.mobileprovision
-
-# Metro
-.metro-health-check*
-
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
 .DS_Store
-*.pem
 
-# local env files
-.env*.local
+# Logs
+*.log
+EOF
 
-# typescript
-*.tsbuildinfo
+# 2) Commit du .gitignore (il est "modified")
+git add .gitignore
+git commit -m "chore: ignore build artifacts, node_modules, Expo, logs"
+
+# (Si tu avais déjà tracké des artefacts, on les retire de l'index — safe même si rien à retirer)
+git rm -r --cached "android/app/build 2" || true
+git rm -r --cached android/app/build || true
+git rm -r --cached android/**/outputs || true
+git rm -r --cached android/**/intermediates || true
+git rm -r --cached android/**/obj || true
+git rm --cached android/app/outputs/apk/release/app-release.apk || true
+git commit -m "chore: stop tracking build artifacts" || true
+
+# 3) Installer git-filter-repo si besoin
+command -v git-filter-repo >/dev/null || brew install git-filter-repo || pip install git-filter-repo
+
+# 4) Purger l’historique des gros fichiers et artefacts (clé du problème)
+#   4a) filet de sécurité : supprimer tout blob > 50MB de l'historique
+git filter-repo --strip-blobs-bigger-than 50M
+
+#   4b) retirer explicitement les types/chemins problématiques (même s’ils n’existent plus aujourd’hui)
+git filter-repo \
+  --invert-paths \
+  --path-glob "*libreactnative.so" \
+  --path-glob "*.apk" \
+  --path-glob "*.aab" \
+  --path-glob "android/**/intermediates/**" \
+  --path-glob "android/**/obj/**" \
+  --path-glob "android/**/outputs/**" \
+  --path "android/app/build 2/" || true
+
+# 5) Vérifier qu’il ne reste pas de gros blobs
+git rev-list --objects --all | \
+  git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | \
+  awk '$1=="blob"{print $3 "\t" $4}' | sort -nr | head -20
+# Si tu vois encore >= 100000000, note le chemin et relance:
+#   git filter-repo --invert-paths --path "<chemin exact>"
+
+# 6) Push en réécrivant l’historique distant
+git push --force origin main
+git push --force --tags || true
