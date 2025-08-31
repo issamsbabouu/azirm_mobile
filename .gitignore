@@ -64,3 +64,4 @@ git rev-list --objects --all | \
 # 6) Push en réécrivant l’historique distant
 git push --force origin main
 git push --force --tags || true
+android/**/build/
