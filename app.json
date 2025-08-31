@@ -6,8 +6,12 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "permissions": ["ACCESS_FINE_LOCATION"],
-    "assetBundlePatterns": ["**/*"],
+    "permissions": [
+      "ACCESS_FINE_LOCATION"
+    ],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.azirm.collector"
@@ -49,7 +53,8 @@
           "locationAlwaysAndWhenInUsePermission": "Allow AZIRM Collector to use your location to track your collection route",
           "locationAlwaysPermission": "Allow AZIRM Collector to use your location for collecting route data"
         }
-      ]
+      ],
+      "expo-maps"
     ],
     "extra": {
       "eas": {

@@ -1,154 +1,210 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { Alert } from 'react-native';
+// src/context/AuthContext.js
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { Alert, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../supabase';
 
-const AuthContext = createContext({});
-
+const AuthContext = createContext(null);
 export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) throw new Error('useAuth must be used within an AuthProvider');
-  return context;
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used within an AuthProvider');
+  return ctx;
 };
 
+/* ====================== Helpers ====================== */
+const getUserName = (u) => {
+  if (!u) return 'Utilisateur';
+  if (u.name?.trim()) return u.name.trim();
+  const first = u.firstName ?? u.prenom ?? '';
+  const last  = u.lastName ?? u.nom ?? '';
+  const full  = `${first} ${last}`.trim();
+  if (full) return full;
+  if (u.username?.trim()) return u.username.trim();
+  if (u.email) return u.email.split('@')[0];
+  return 'Utilisateur';
+};
+
+const extractPosteLabel = (obj) =>
+    obj?.poste?.nom ?? obj?.poste?.name ?? obj?.poste_nom ?? obj?.poste_name ?? null;
+
+const fetchPosteLabelById = async (posteId) => {
+  if (!posteId) return null;
+  const { data, error } = await supabase
+      .from('poste') // adapte si la table s'appelle "postes"
+      .select('id, nom, name')
+      .eq('id', posteId)
+      .maybeSingle();
+  if (error) {
+    console.error('❌ fetchPosteLabelById:', error);
+    return null;
+  }
+  return data?.nom ?? data?.name ?? null;
+};
+
+const ensurePosteLabel = async (rawUser) => {
+  if (!rawUser) return rawUser;
+  const u = { ...rawUser };
+  u.poste_id    = u.poste_id ?? u.posteId ?? null;
+  u.poste_label = u.poste_label ?? extractPosteLabel(u) ?? null;
+  if (!u.poste_label && u.poste_id) {
+    u.poste_label = await fetchPosteLabelById(u.poste_id);
+  }
+  return u;
+};
+
+// --- Helpers temps de connexion ---
+const msToHours = (ms) => Math.max(0, ms) / 3600000;
+const round2 = (n) => Math.round(n * 100) / 100;
+
+const formatHMS = (totalMs) => {
+  const t = Math.max(0, Math.floor(totalMs / 1000));
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = t % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
+};
+
+/**
+ * Incrémente le cumul d'heures côté DB (RPC atomique).
+ * Requiert la fonction SQL: public.increment_heures_depensees(p_user_id uuid, p_inc_hours numeric)
+ * et des policies RLS compatibles.
+ */
+const addElapsedHoursToDb = async (userId, incHours) => {
+  if (!userId || !Number.isFinite(incHours) || incHours <= 0) return null;
+  const { error } = await supabase.rpc('increment_heures_depensees', {
+    p_user_id: userId,
+    p_inc_hours: round2(incHours),
+  });
+  if (error) {
+    console.error('❌ RPC increment_heures_depensees:', error);
+    return null;
+  }
+  return true;
+};
+
+// Finalise une session: calcule le temps écoulé depuis loginStart, crédite en DB
+const finalizeSessionAndPersist = async (savedOrState) => {
+  try {
+    const uid = savedOrState?.user?.id;
+    const start = Number(savedOrState?.loginStart ?? 0);
+    if (!uid || !start) return;
+
+    const now = Date.now();
+    const hardStop = savedOrState?.expiresAt ? new Date(savedOrState.expiresAt).getTime() : now;
+    const until = Math.min(now, hardStop);
+
+    const elapsedMs = until - start;
+    const incHours = round2(msToHours(elapsedMs));
+    if (incHours > 0) {
+      await addElapsedHoursToDb(uid, incHours);
+    }
+  } catch (e) {
+    console.error('❌ finalizeSessionAndPersist:', e);
+  }
+};
+
+/* ====================== Provider ====================== */
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(null);               // objet ENTIER users (+ poste joint)
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [loginStartTime, setLoginStartTime] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
 
-  const saveSession = async (sessionData) => {
-    try {
-      await AsyncStorage.setItem('userSession', JSON.stringify(sessionData));
-    } catch (error) {
-      console.error('❌ Erreur sauvegarde session:', error);
-    }
-  };
+  // Ticker live
+  const [nowTs, setNowTs] = useState(Date.now());
+  const tickRef = useRef(null);
 
+  // Flush périodique
+  const FLUSH_MS = 60_000; // 60s => quasi temps réel DB
+  const flushRef = useRef(null);
+  const isFlushing = useRef(false);
+
+  // Session storage
+  const saveSession = async (sessionData) => {
+    try { await AsyncStorage.setItem('userSession', JSON.stringify(sessionData)); }
+    catch (e) { console.error('❌ saveSession:', e); }
+  };
   const getSavedSession = async () => {
     try {
-      const savedSession = await AsyncStorage.getItem('userSession');
-      return savedSession ? JSON.parse(savedSession) : null;
-    } catch (error) {
-      console.error('❌ Erreur récupération session:', error);
+      const s = await AsyncStorage.getItem('userSession');
+      return s ? JSON.parse(s) : null;
+    } catch (e) {
+      console.error('❌ getSavedSession:', e);
       return null;
     }
   };
-
   const clearSession = async () => {
     try {
       await AsyncStorage.removeItem('userSession');
-      await AsyncStorage.removeItem('session'); // au cas où ancien format
+      await AsyncStorage.removeItem('session'); // anciens formats
       setUser(null);
-    } catch (error) {
-      console.error('❌ Erreur clear session:', error);
+      setLoginStartTime(null);
+      setIsAuthenticated(false);
+    } catch (e) {
+      console.error('❌ clearSession:', e);
     }
   };
 
-  const getUserName = (userData) => {
-    if (!userData) return 'Utilisateur';
-    if (userData.name?.trim()) return userData.name.trim();
-    const firstName = userData.firstName || userData.prenom || '';
-    const lastName = userData.lastName || userData.nom || '';
-    const fullName = `${firstName} ${lastName}`.trim();
-    if (fullName) return fullName;
-    if (userData.username?.trim()) return userData.username.trim();
-    if (userData.email) return userData.email.split('@')[0];
-    return 'Utilisateur';
-  };
-
+  // Restauration au démarrage
   useEffect(() => {
-    const initializeAuth = async () => {
+    (async () => {
       setIsInitializing(true);
       try {
-        const savedSession = await getSavedSession();
-        if (savedSession?.user) {
-          const expired = savedSession.expiresAt && new Date() > new Date(savedSession.expiresAt);
+        const saved = await getSavedSession();
+        if (saved?.user) {
+          const now = new Date();
+          const expired = saved.expiresAt && now > new Date(saved.expiresAt);
+
           if (expired) {
             console.log('⛔ Session expirée');
+            await finalizeSessionAndPersist(saved); // crédite jusqu’à l’expiration
             await clearSession();
           } else {
-            setUser(savedSession.user);
-            setLoginStartTime(savedSession.loginStart || null);
-            console.log('✅ Session restaurée pour:', getUserName(savedSession.user));
+            const restored = await ensurePosteLabel(saved.user);
+            setUser(restored);
+            setLoginStartTime(saved.loginStart || null);
+            setIsAuthenticated(true);
           }
         }
-      } catch (err) {
-        console.error('❌ Erreur init auth:', err);
+      } catch (e) {
+        console.error('❌ init auth:', e);
       } finally {
         setIsInitializing(false);
       }
-    };
-
-    initializeAuth();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-        async (event, session) => {
-          console.log('⚙️ Auth state changed:', event, session?.user?.email);
-          if (session?.user) {
-            const { data: collectorData } = await supabase
-                .from('collectors')
-                .select('*')
-                .eq('email', session.user.email)
-                .single();
-
-            const userData = { ...session.user, collectorData };
-            setUser(userData);
-
-            await saveSession({
-              user: userData,
-              loginStart: Date.now(),
-              expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-            });
-
-            setLoginStartTime(Date.now());
-            console.log('✅ Connecté :', getUserName(userData));
-          } else {
-            await clearSession();
-          }
-          setIsInitializing(false);
-        }
-    );
-
-    return () => subscription.unsubscribe();
+    })();
   }, []);
 
+  // Connexion — récupère TOUTES les colonnes users (*) + jointure poste
   const login = async (email, password) => {
     setIsLoading(true);
     const trimmedEmail = email.trim().toLowerCase();
-
     try {
-      const { data: userData, error } = await supabase
+      const { data, error } = await supabase
           .from('users')
-          .select('*')
-          .eq('email', trimmedEmail)
+          .select(`
+          *,
+          poste:poste_id ( id, nom, name )
+        `)
+          .ilike('email', trimmedEmail)
           .eq('password', password)
-          .single();
+          .maybeSingle();
 
-      if (error || !userData) throw new Error('Email ou mot de passe incorrect');
+      if (error || !data) throw new Error('Email ou mot de passe incorrect');
 
-      const completeUser = {
-        id: userData.id,
-        email: userData.email,
-        role: userData.role,
-        name: userData.name,
-        firstName: userData.firstName || userData.prenom,
-        lastName: userData.lastName || userData.nom,
-        username: userData.username,
-        phone: userData.phone || userData.telephone,
-        bureau_id: userData.bureau_id
-      };
+      const completeUser = await ensurePosteLabel(data);
 
       const now = Date.now();
       await saveSession({
         user: completeUser,
         loginStart: now,
-        expiresAt: new Date(now + 24 * 60 * 60 * 1000).toISOString()
+        expiresAt: new Date(now + 86400000).toISOString(), // 24h
       });
 
       setUser(completeUser);
+      setIsAuthenticated(true);
       setLoginStartTime(now);
-      console.log('✅ Connexion réussie :', getUserName(completeUser));
 
       return { auth: { user: completeUser }, profile: completeUser };
     } catch (err) {
@@ -159,47 +215,26 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
+  // Déconnexion — crédite puis nettoie
   const logout = async () => {
     setIsLoading(true);
     try {
-      const now = Date.now();
-      const currentUserName = getUserName(user);
+      const name = getUserName(user);
+
+      // stop intervals pour éviter double flush
+      if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
+      if (flushRef.current) { clearInterval(flushRef.current); flushRef.current = null; }
 
       if (user && loginStartTime) {
-        const durationMs = now - loginStartTime;
-        const totalSeconds = Math.floor(durationMs / 1000);
-        const h = Math.floor(totalSeconds / 3600);
-        const m = Math.floor((totalSeconds % 3600) / 60);
-        const s = totalSeconds % 60;
-        const hoursUsed = h + m / 60 + s / 3600;
-
-        const { data: collector, error } = await supabase
-            .from('collectors')
-            .select('hours_served')
-            .eq('user_id', user.id)
-            .single();
-
-        const currentHours = collector?.hours_served != null ? collector.hours_served : 0;
-        const updated = currentHours + hoursUsed;
-
-        const { error: updateError } = await supabase
-            .from('collectors')
-            .update({ hours_served: updated })
-            .eq('user_id', user.id);
-
-        if (updateError) {
-          console.error('❌ Erreur update hours_served:', updateError);
-        } else {
-          console.log(`⏱️ Session : ${h}h ${m}m ${s}s → Total: ${updated.toFixed(2)}h`);
-        }
+        await finalizeSessionAndPersist({ user, loginStart: loginStartTime });
       }
-
-      setLoginStartTime(null);
       await clearSession();
-      const { error } = await supabase.auth.signOut();
-      if (error) console.error('❌ Supabase signOut:', error);
 
-      console.log('👋 Déconnexion réussie pour :', currentUserName);
+      try {
+        const { error } = await supabase.auth.signOut();
+        if (error) console.error('❌ Supabase signOut:', error);
+      } catch {}
+      console.log('👋 Déconnexion réussie pour :', name);
     } catch (err) {
       console.error('❌ Logout error:', err);
       await clearSession();
@@ -224,36 +259,7 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
-  const updateCollectorData = async (updates) => {
-    if (!user) return;
-    try {
-      const { data, error } = await supabase
-          .from('collectors')
-          .update(updates)
-          .eq('id', user.id)
-          .select()
-          .single();
-
-      if (error) throw error;
-
-      const updatedUser = {
-        ...user,
-        collectorData: { ...user.collectorData, ...data }
-      };
-
-      setUser(updatedUser);
-      await saveSession({
-        user: updatedUser,
-        expiresAt: new Date(Date.now() + 86400000).toISOString()
-      });
-
-      return data;
-    } catch (err) {
-      console.error('❌ Update collector:', err);
-      throw err;
-    }
-  };
-
+  // Mettre à jour et recharger TOUTES les colonnes + poste
   const updateUserProfile = async (updates) => {
     if (!user) return;
     try {
@@ -261,18 +267,21 @@ export const AuthProvider = ({ children }) => {
           .from('users')
           .update(updates)
           .eq('id', user.id)
-          .select()
-          .single();
+          .select(`
+          *,
+          poste:poste_id ( id, nom, name )
+        `)
+          .maybeSingle();
 
       if (error) throw error;
 
-      const updatedUser = { ...user, ...updates };
+      const updatedUser = await ensurePosteLabel(data);
       setUser(updatedUser);
       await saveSession({
         user: updatedUser,
-        expiresAt: new Date(Date.now() + 86400000).toISOString()
+        loginStart: loginStartTime,
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
       });
-
       return updatedUser;
     } catch (err) {
       console.error('❌ Update profile:', err);
@@ -280,28 +289,116 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
+  // --------- LIVE TICKER (affichage) ----------
+  useEffect(() => {
+    if (!isAuthenticated || !loginStartTime) return;
+    // tick chaque seconde pour l'affichage live
+    tickRef.current && clearInterval(tickRef.current);
+    tickRef.current = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => {
+      tickRef.current && clearInterval(tickRef.current);
+      tickRef.current = null;
+    };
+  }, [isAuthenticated, loginStartTime]);
+
+  // --------- FLUSH PÉRIODIQUE (persistance quasi temps réel) ----------
+  const doPeriodicFlush = async () => {
+    if (!user || !loginStartTime || isFlushing.current) return;
+    isFlushing.current = true;
+    try {
+      const now = Date.now();
+      const incHours = round2(msToHours(now - loginStartTime));
+      if (incHours > 0) {
+        const ok = await addElapsedHoursToDb(user.id, incHours);
+        if (ok) {
+          // Mets à jour l'utilisateur localement pour refléter le cumul
+          setUser((prev) => prev ? { ...prev, heures_depensees: round2((prev.heures_depensees ?? 0) + incHours) } : prev);
+          // Redémarre le segment
+          setLoginStartTime(now);
+          await saveSession({
+            user: { ...(user || {}), heures_depensees: round2((user?.heures_depensees ?? 0) + incHours) },
+            loginStart: now,
+            expiresAt: new Date(now + 86400000).toISOString(),
+          });
+        }
+      }
+    } catch (e) {
+      console.error('❌ doPeriodicFlush:', e);
+    } finally {
+      isFlushing.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated || !loginStartTime) return;
+    flushRef.current && clearInterval(flushRef.current);
+    flushRef.current = setInterval(doPeriodicFlush, FLUSH_MS);
+    return () => {
+      flushRef.current && clearInterval(flushRef.current);
+      flushRef.current = null;
+    };
+  }, [isAuthenticated, loginStartTime, user?.id]);
+
+  // Auto-flush à la mise en arrière-plan
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'background') {
+        doPeriodicFlush();
+      }
+    });
+    return () => sub.remove();
+  }, [user, loginStartTime]);
+
+  // Flush manuel (si besoin à d'autres moments)
+  const flushElapsedNow = async () => {
+    await doPeriodicFlush();
+  };
+
+  // --------- VALEURS LIVE EXPOSEES ----------
+  const baseHours = Number(user?.heures_depensees ?? 0);
+  const sessionMs = loginStartTime ? Math.max(0, nowTs - loginStartTime) : 0;
+  const liveMs = baseHours * 3600000 + sessionMs;
+  const liveHours = round2(liveMs / 3600000);
+  const liveTimeFormatted = formatHMS(liveMs);
+
   const userName = getUserName(user);
 
   return (
       <AuthContext.Provider
           value={{
+            // state
             user,
+            isAuthenticated,
             isLoading,
             isInitializing,
+            loginStartTime,
+
+            // actions
             login,
             logout,
             resetPassword,
-            updateCollectorData,
             updateUserProfile,
             clearSession,
+            flushElapsedNow,
+
+            // live (temps réel)
+            liveMs,
+            liveHours,
+            liveTimeFormatted,
+
+            // setters si besoin
+            setUser,
+            setIsAuthenticated,
+
+            // helpers
             getUserName,
-            isAuthenticated: !!user,
             userName,
+
+            // accès rapides (optionnels)
             userEmail: user?.email,
             userRole: user?.role,
-            userFirstName: user?.firstName || user?.prenom,
-            userLastName: user?.lastName || user?.nom,
-            userFullName: user?.firstName && user?.lastName ? `${user.firstName} ${user.lastName}` : userName,
+            userPosteId: user?.poste_id ?? user?.posteId,
+            userPosteLabel: user?.poste_label || user?.poste?.nom || user?.poste?.name,
           }}
       >
         {children}

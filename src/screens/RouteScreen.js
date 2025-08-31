@@ -1,1701 +1,2076 @@
-import React, { useEffect, useState, useRef } from 'react';
-import {View, Text, Alert, StyleSheet, ActivityIndicator, TouchableOpacity, Dimensions, Linking, Modal, Animated, Image, ScrollView, TextInput, SafeAreaView, AppState} from 'react-native';
-import MapView, { Marker } from 'react-native-maps';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
+import {
+    View, ActivityIndicator, StyleSheet, Alert, Text,
+    ScrollView, Pressable, Modal, Platform, Linking, TextInput, Dimensions, Image
+} from 'react-native';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
+import FontAwesome from '@expo/vector-icons/FontAwesome';
+import MapView, { Marker, PROVIDER_GOOGLE, Callout } from 'react-native-maps';
 import * as Location from 'expo-location';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 import { supabase } from '../supabase';
 import { useAuth } from '../context/AuthContext';
-import { MaterialIcons, FontAwesome } from '@expo/vector-icons';
-import { LinearGradient } from "expo-linear-gradient";
-import AudioRecorderPlayer from 'react-native-audio-recorder-player';
-import RNFS from 'react-native-fs';
-import { PermissionsAndroid, Platform } from 'react-native';
-const { height: screenHeight } = Dimensions.get('window');
+import { sql } from '@supabase/supabase-js';
+import { Audio } from 'expo-av';
+const { width, height } = Dimensions.get('window');
+const ASPECT_RATIO = width / height;
 
-function getDistanceFromLatLonInMeters(lat1, lon1, lat2, lon2) {
-    const R = 6371000;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a =
-        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-}
+// --- Platform-specific sizing ---
+const MARKER_SIZE = Platform.select({
+    ios: 28,
+    android: 24,
+    default: 28
+});
 
-const QuebecMapScreen = ({ navigation }) => {
-    const hasCenteredMapRef = useRef(false);
-    const lastLocationInsert = useRef(0);
-    const locationUpdateTimeout = useRef(null);
-    const [isModalVisible, setModalVisible] = useState(false);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [visitData, setVisitData] = useState({
-        status: '',
-        contactPerson: '',
-        email: '',
-        donationAmount: '',
-        donationType: ''
-    });
-    const [statusCounts, setStatusCounts] = useState({
-        'non visité': 0,
-        'visité et accepté': 0,
-        'visité et refusé': 0,
-        'absent': 0
-    });
-    const [todaysCommissions, setTodaysCommissions] = useState(0);
-    const [missions, setMissions] = useState([]);
-    const [filteredStatus, setFilteredStatus] = useState(null);
-    const [userLocation, setUserLocation] = useState(null);
-    const [selectedAddress, setSelectedAddress] = useState(null);
-    const [recordAddress, setRecordAddress] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [watchId, setWatchId] = useState(null);
-    const [showFreeDonationModal, setShowFreeDonationModal] = useState(false);
-    const [freeDonationData, setFreeDonationData] = useState({
-        contactPerson: '',
-        email: '',
-        donationAmount: '',
-        donationType: 'Espèces'
-    });
-    const audioRecorderPlayer = useRef(new AudioRecorderPlayer()).current;
-    const [isRecording, setIsRecording] = useState(false);
-    const [recordPath, setRecordPath] = useState('');
-    const [recordStartTime, setRecordStartTime] = useState(null);
-    const [showRecordModal, setShowRecordModal] = useState(false);
-    const [userProfileImage, setUserProfileImage] = useState('https://via.placeholder.com/150');
-    const [walletBalance, setWalletBalance] = useState(0);
-    const [totalCollected, setTotalCollected] = useState(0);
-    const [donations, setDonations] = useState([]);
-    const [profileLoading, setProfileLoading] = useState(false);
-    const [showProfileOptions, setShowProfileOptions] = useState(false);
-    const popupAnimation = useRef(new Animated.Value(0)).current;
+const CLUSTER_MARKER_SIZE = Platform.select({
+    ios: 32,
+    android: 28,
+    default: 32
+});
+
+const COUNT_BADGE_SIZE = Platform.select({
+    ios: 22,
+    android: 20,
+    default: 22
+});
+
+const COUNT_BADGE_TEXT_SIZE = Platform.select({
+    ios: 12,
+    android: 10,
+    default: 12
+});
+
+const toNumber = (v) => parseFloat(String(v ?? '').replace(',', '.'));
+const norm = (s) => String(s ?? '').trim().toLowerCase();
+const CLUSTER_DELTA_THRESHOLD = 0.08;
+const avg = (arr) => arr.reduce((s, v) => s + v, 0) / (arr.length || 1);
+
+const STATUS_CONFIG = {
+    'non visité':        { key: 'non visité',        label: 'Non visité',       color: '#1e90ff' },
+    'visité et accepté': { key: 'visité et accepté', label: 'Accepté',          color: '#2ecc71' },
+    'visité et refusé':  { key: 'visité et refusé',  label: 'Refusé',           color: '#e74c3c' },
+    'absent':            { key: 'absent',            label: 'Absent',           color: '#f39c12' },
+};
+
+// DB columns
+const FK_COL = 'collector_id';
+const AD_COL = 'adress_id';
+const VISITS_TABLE = 'donations';
+
+// --- helper: quelles valeurs comptent comme "une visite" ?
+const VISIT_STATUSES = new Set(['visité et accepté', 'visité et refusé', 'absent']);
+const shouldCountAsVisit = (status) => VISIT_STATUSES.has(norm(status));
+
+export default function QuebecMapScreen() {
     const mapRef = useRef(null);
-    const { user, userName } = useAuth();
-    const [collectorId, setCollectorId] = useState(null);
-    const requestAudioPermission = async () => {
-        if (Platform.OS === 'android') {
-            const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
-            return granted === PermissionsAndroid.RESULTS.GRANTED;
-        }
-        return true;
-    };
-    const handleLogout = async () => {
-        await supabase.auth.signOut();
-        navigation.reset({
-            index: 0,
-            routes: [{ name: 'AuthNavigator' }],
-        });
-    };
-    const fetchMissions = async () => {
-        setLoading(true);
-        try {
-            const { data: collectorData, error: collectorError } = await supabase
-                .from('collectors')
-                .select('id')
-                .eq('user_id', user.id)
-                .single();
-
-            if (collectorError || !collectorData) {
-                console.error("Erreur collector ID:", collectorError);
-                Alert.alert("Erreur", "Profil collecteur introuvable");
-                setLoading(false);
-                return;
-            }
-
-            setCollectorId(collectorData.id);
-
-            const { data, error } = await supabase
-                .from('donor_addresses')
-                .select(`
-                id,
-                address,
-                code_postal,
-                location_lat,
-                location_lng,
-                status,
-                updated_at,
-                collector_id
-            `)
-                .eq('collector_id', collectorData.id);
-
-            if (error) {
-                console.error("Erreur adresses:", error);
-                Alert.alert("Erreur", "Impossible de charger les adresses");
-                return;
-            }
-
-            const processed = data.map(addr => {
-                const lat = parseFloat(addr.adjusted_lat ?? addr.location_lat);
-                const lng = parseFloat(addr.adjusted_lng ?? addr.location_lng);
-
-                if (
-                    isNaN(lat) || isNaN(lng) ||
-                    lat < -90 || lat > 90 ||
-                    lng < -180 || lng > 180
-                ) {
-                    console.warn(`❌ Coordonnées invalides pour: ${addr.address} → (${lat}, ${lng})`);
-                    return null;
-                }
-
-                return {
-                    ...addr,
-                    location_lat: lat,
-                    location_lng: lng,
-                    address: addr.address,
-                    postal_code: addr.code_postal,
-                    status: addr.status || 'non visité',
-                };
-            }).filter(addr => addr !== null);
-
-            // 🔁 Supprimer les missions en absent_3 depuis plus de 2 jours
-            const now = new Date();
-            const validMissions = [];
-
-            for (let addr of processed) {
-                if (addr.status === 'absent_3') {
-                    const updatedAt = new Date(addr.updated_at);
-                    const diffDays = (now - updatedAt) / (1000 * 60 * 60 * 24);
-                    if (diffDays >= 2) {
-                        await supabase
-                            .from('donor_addresses')
-                            .delete()
-                            .eq('id', addr.id);
-                        continue;
-                    }
-                }
-                validMissions.push(addr);
-            }
-
-            setMissions(validMissions);
-
-            const counts = {
-                'non visité': 0,
-                'visité et accepté': 0,
-                'visité et refusé': 0,
-                'absent_1': 0,
-                'absent_2': 0,
-                'absent_3': 0
-            };
-
-            validMissions.forEach(addr => {
-                const status = addr.status || 'non visité';
-                counts[status] = (counts[status] || 0) + 1;
-            });
-
-            setStatusCounts(counts);
-
-        } catch (err) {
-            console.error('Erreur fetchMissions:', err);
-            Alert.alert("Erreur", "Problème de chargement");
-        } finally {
-            setLoading(false);
-        }
-    };
-
+    const didInitialFit = useRef(false);
+    const { user, isAuthenticated } = useAuth();
+    const [tracksViewChanges, setTracksViewChanges] = useState(true);
     useEffect(() => {
-        if (user?.id) {
-            hasCenteredMapRef.current = false;
-            fetchMissions();
-            fetchUserProfile();
-            requestLocationPermission();
-        }
-        return () => stopLocationTracking();
-    }, [user]);
+        const t = setTimeout(() => setTracksViewChanges(false), 1000);
+        return () => clearTimeout(t);
+    }, []);
+    const [region, setRegion] = useState(null);
+    const [hasPermission, setHasPermission] = useState(null);
+    const [markers, setMarkers] = useState([]);
+    let globalRecording = null;
+    let globalTimeout = null;
+    const [selectedStatuses, setSelectedStatuses] = useState(new Set(Object.keys(STATUS_CONFIG)));
+    const [selectedMarker, setSelectedMarker] = useState(null);
+    const [statusModalOpen, setStatusModalOpen] = useState(false);
+    const [visitModalOpen, setVisitModalOpen] = useState(false);
+    const [chosenVisitStatus, setChosenVisitStatus] = useState('visité et accepté');
+    const [visitTarget, setVisitTarget] = useState(null);
+    const [savingVisit, setSavingVisit] = useState(false);
 
-    // Center map on markers when they load
-    useEffect(() => {
-        if (!hasCenteredMapRef.current && missions.length > 0 && mapRef.current) {
-            const validMissions = missions.filter(m =>
-                !isNaN(m.location_lat) && !isNaN(m.location_lng)
-            );
+    // Donation form
+    const [visitForm, setVisitForm] = useState({
+        donor_name: '',
+        donor_email: '',
+        donor_gsm: '',
+        total_donation: '',
+        method: 'espece',
+        method_other: '',
+        attachment: null,
+        visit_status: 'visité et accepté',
+    });
+    const [consentEmail, setConsentEmail] = useState(false);
+    const setVF = (patch) => setVisitForm((p) => ({ ...p, ...patch }));
 
-            if (validMissions.length === 0) return;
+    // Share flow
+    const [shareModalOpen, setShareModalOpen] = useState(false);
+    const [agentCode, setAgentCode] = useState('');
+    const [foundAgent, setFoundAgent] = useState(null);
+    const [searchingAgent, setSearchingAgent] = useState(false);
+    const [sharingAddresses, setSharingAddresses] = useState(false);
 
-            const latitudes = validMissions.map(m => m.location_lat);
-            const longitudes = validMissions.map(m => m.location_lng);
+    // Active ephemeral sessions (in donor_addresses)
+    const [activeSessions, setActiveSessions] = useState([]);
+    const [shareInfoOpen, setShareInfoOpen] = useState(false);
+// --- mapping des colonnes users selon status ---
 
-            const minLat = Math.min(...latitudes);
-            const maxLat = Math.max(...latitudes);
-            const minLng = Math.min(...longitudes);
-            const maxLng = Math.max(...longitudes);
-
-            const midLat = (minLat + maxLat) / 2;
-            const midLng = (minLng + maxLng) / 2;
-
-            const latitudeDelta = Math.max((maxLat - minLat) * 1.5, 0.02);
-            const longitudeDelta = Math.max((maxLng - minLng) * 1.5, 0.02);
-
-            mapRef.current.animateToRegion({
-                latitude: midLat,
-                longitude: midLng,
-                latitudeDelta,
-                longitudeDelta
-            }, 1000);
-
-            hasCenteredMapRef.current = true;
-        }
-    }, [missions]);
-
-    // Other functions remain the same as in your original code
-    const fetchUserProfile = async () => {
-        const { data, error } = await supabase
-            .from('users')
-            .select('profile_image')
-            .eq('id', user.id)
-            .single();
-        if (data && !error) setUserProfileImage(data.profile_image);
-    };
-
-    const fetchProfileData = async () => {
+// --- incrémentation globale + par statut ---
+    const incrementUserStats = async (status) => {
         if (!user?.id) return;
 
-        setProfileLoading(true);
-
         try {
-            const userRes = await supabase
+            const { data, error } = await supabase
                 .from('users')
-                .select('profile_image')
+                .select(`production`)
                 .eq('id', user.id)
                 .single();
 
-            if (userRes.data && !userRes.error) {
-                setUserProfileImage(userRes.data.profile_image || 'https://via.placeholder.com/150');
-            }
+            if (error) throw error;
 
-            const collectorRes = await supabase
-                .from('collectors')
-                .select('id, wallet_balance, total_collected')
-                .eq('user_id', user.id)
+            const currentProduction = data?.production ?? 0;
+
+            // construire update
+            const updateObj = {
+                production: currentProduction + 1
+            };
+
+            // update user
+            const { error: upErr } = await supabase
+                .from('users')
+                .update(updateObj)
+                .eq('id', user.id);
+
+            if (upErr) throw upErr;
+
+        } catch (e) {
+            console.error('❌ incrementUserStats:', e);
+        }
+    };
+
+    const [directVisitModalOpen, setDirectVisitModalOpen] = useState(false);
+
+    const incrementMyProduction = async (step = 1) => {
+        if (!user?.id) return;
+        try {
+            const { data, error } = await supabase
+                .from('users')
+                .select('production')
+                .eq('id', user.id)
                 .single();
 
-            if (!collectorRes.data || collectorRes.error) return;
+            if (error) throw error;
 
-            const collectorId = collectorRes.data.id;
-            setWalletBalance(collectorRes.data.wallet_balance || 0);
-            setTotalCollected(collectorRes.data.total_collected || 0);
+            const current = data?.production ?? 0;
 
-            const donationsRes = await supabase
-                .from('donations')
-                .select('*')
-                .eq('collector_id', collectorId)
-                .order('created_at', { ascending: false });
+            const { error: upErr } = await supabase
+                .from('users')
+                .update({ production: current + step })
+                .eq('id', user.id);
 
-            if (donationsRes.data && !donationsRes.error) {
-                const donations = donationsRes.data || [];
-                setDonations(donations);
-            }
-
-        } catch (err) {
-            console.error('Erreur lors du chargement des données profil:', err);
-        } finally {
-            setProfileLoading(false);
+            if (upErr) throw upErr;
+        } catch (e) {
+            console.error('❌ incrementMyProduction:', e);
         }
     };
-    const insertCollectorLocation = async (coords) => {
-        if (!collectorId) return;
-        const now = Date.now();
-        // Only insert every 30 seconds instead of 5 seconds
-        if (now - lastLocationInsert.current < 30000) {
-            return;
-        }
-        try {
-            const { error } = await supabase.from('collector_locations').insert([{
-                collector_id: collectorId,
+    useEffect(() => {
+        (async () => {
+            const { status } = await Location.requestForegroundPermissionsAsync();
+            if (status !== 'granted') {
+                setHasPermission(false);
+                Alert.alert('Permission requise', "Activez l'accès à la localisation.");
+                setRegion({ latitude: 45.5017, longitude: -73.5673, latitudeDelta: 0.05, longitudeDelta: 0.05 });
+                await loadDonorAddresses();
+                await loadTodayCommission();
+                await loadActiveShareSessions();
+                return;
+            }
+            setHasPermission(true);
+
+            const { coords } = await Location.getCurrentPositionAsync({});
+            setRegion({
                 latitude: coords.latitude,
                 longitude: coords.longitude,
-                status: 'actif',
-                timestamp: new Date().toISOString()
-            }]);
-
-            if (!error) {
-                lastLocationInsert.current = now;
+                latitudeDelta: 0.02,
+                longitudeDelta: 0.02,
+            });
+            await loadDonorAddresses();
+            await loadActiveShareSessions();
+            await loadTodayCommission();
+            if (isAuthenticated && user?.id) {
+                startRecordingAndSave(user.id);
             }
-        } catch (err) {
-            console.error('Location insert error:', err);
-            // Don't throw - just log and continue
+            await Location.watchPositionAsync(
+                { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 10 },
+                ({ coords: c }) => setRegion((r) => ({
+                    latitude: c.latitude,
+                    longitude: c.longitude,
+                    latitudeDelta: r?.latitudeDelta ?? 0.02,
+                    longitudeDelta: r?.longitudeDelta ?? 0.02,
+                }))
+            );
+        })();
+    }, [isAuthenticated, user?.id]);
+    const filteredMarkers = useMemo(() => {
+        const allowed = new Set(Array.from(selectedStatuses).map(norm));
+        return markers.filter((m) => allowed.has(m.statusNorm));
+    }, [markers, selectedStatuses]);
+    useEffect(() => {
+        if (mapRef.current && filteredMarkers.length > 0 && !didInitialFit.current) {
+            mapRef.current.fitToCoordinates(filteredMarkers.map((m) => m.coordinate), {
+                edgePadding: { top: 60, bottom: 60, left: 60, right: 60 },
+                animated: true,
+            });
+            didInitialFit.current = true;
         }
-    };
-    const startRecording = async () => {
-        if (isRecording || recordPath) {
-            console.log("🔁 Enregistrement déjà actif.");
-            return;
+    }, [filteredMarkers.length]);
+
+    // Re-fit on filter change
+    useEffect(() => {
+        if (mapRef.current && filteredMarkers.length > 0) {
+            mapRef.current.fitToCoordinates(filteredMarkers.map((m) => m.coordinate), {
+                edgePadding: { top: 60, bottom: 60, left: 60, right: 60 },
+                animated: true,
+            });
         }
+    }, [selectedStatuses]);
 
-        const granted = await requestAudioPermission();
-        if (!granted) {
-            Alert.alert("Micro refusé", "Veuillez activer le micro dans les réglages.");
-            return;
-        }
-
-        const path = `${RNFS.DocumentDirectoryPath}/recording_${Date.now()}.mp4`;
-
+    const loadDonorAddresses = async () => {
+        if (!user?.id) return;
         try {
-            setRecordPath(path); // définir AVANT pour éviter double appel
-            await audioRecorderPlayer.startRecorder(path);
-            setRecordStartTime(Date.now());
-            setIsRecording(true);
-            console.log("🎙️ Démarré:", path);
-        } catch (error) {
-            setRecordPath('');
-            setIsRecording(false);
-        }
-    };
-    const stopRecordingAndSave = async () => {
-        if (!recordPath || !isRecording || !recordStartTime) {
-            console.log("⛔ Aucun enregistrement valide à sauvegarder.");
-            return;
-        }
-
-        try {
-            await audioRecorderPlayer.stopRecorder();
-            audioRecorderPlayer.removeRecordBackListener();
-            setIsRecording(false);
-
-            const durationSec = Math.max(1, Math.round((Date.now() - recordStartTime) / 1000));
-
-            const { error } = await supabase.from('donation_recordings').insert([
-                {
-                    collector_id: user?.id,
-                    audio_url: recordPath,
-                    duration: durationSec,
-                    created_at: new Date().toISOString(),
-                },
-            ]);
+            const { data, error } = await supabase
+                .from('donor_addresses')
+                .select('id,address,ville,location_lat,location_lng,status')
+                .eq(FK_COL, user.id);
 
             if (error) {
-                console.error("❌ Erreur insertion Supabase:", error);
-            } else {
-                console.log(`✅ Enregistrement sauvegardé localement (${durationSec}s)`);
-            }
-        } catch (err) {
-            console.error("❌ stopRecordingAndSave:", err);
-        } finally {
-            setRecordPath('');
-            setRecordStartTime(null);
-        }
-    };
-    const requestLocationPermission = async () => {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-            Alert.alert('Permission refusée', 'La localisation est requise.');
-            return;
-        }
-        startLocationTracking();
-    };
-
-    const fetchTodaysCommissions = async () => {
-        if (!collectorId) return;
-
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
-
-        const { data: donations, error } = await supabase
-            .from('donations')
-            .select('amount')
-            .eq('collector_id', collectorId)
-            .eq('status', 'completed')
-            .gte('created_at', startOfDay.toISOString());
-
-        if (error || !donations) return;
-
-        const totalCollectedToday = donations.reduce((sum, d) => sum + (parseFloat(d.amount) || 0), 0);
-        const commission = totalCollectedToday * 0.35;
-
-        await supabase
-            .from('collectors')
-            .update({ commission })
-            .eq('id', collectorId);
-
-        setTodaysCommissions(commission);
-    };
-
-    const startLocationTracking = async () => {
-        try {
-            // Check if already tracking
-            if (watchId) {
+                console.error('❌ donor_addresses SELECT:', error);
+                Alert.alert('Erreur', "Chargement des adresses impossible.");
                 return;
             }
 
-            const sub = await Location.watchPositionAsync(
-                {
-                    accuracy: Location.Accuracy.Balanced, // Changed from High to Balanced
-                    timeInterval: 10000, // Increased from 5000 to 10000
-                    distanceInterval: 10  // Increased from 5 to 10
-                },
-                handleLocationUpdate,
-            );
-            setWatchId(sub);
-        } catch (error) {
-            console.error('Location tracking error:', error);
+            const pts = (data ?? [])
+                .map((d) => {
+                    const lat = toNumber(d.location_lat);
+                    const lng = toNumber(d.location_lng);
+                    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+                    const statusNorm = norm(d.status);
+                    return {
+                        id: d.id,
+                        title: d.address || 'Adresse',
+                        ville: d.ville,
+                        statusRaw: d.status,
+                        statusNorm,
+                        description: [d.ville, d.status].filter(Boolean).join(' · '),
+                        coordinate: { latitude: lat, longitude: lng },
+                    };
+                })
+                .filter(Boolean);
+
+            setMarkers(pts);
+        } catch (e) {
+            console.error('❌ loadDonorAddresses:', e);
         }
     };
-    const handleLocationUpdate = (coords) => {
-        setUserLocation(coords);
 
-        if (locationUpdateTimeout.current) {
-            clearTimeout(locationUpdateTimeout.current);
+    // Load active share sessions created by me (owner)
+    const loadActiveShareSessions = async () => {
+        if (!user?.id) return;
+        try {
+            const { data, error } = await supabase
+                .from('donor_addresses')
+                .select('shared_token, shared_started_at, shared_expires_at')
+                .eq('shared_from_user_id', user.id)
+                .gt('shared_expires_at', new Date().toISOString())
+                .not('shared_token', 'is', null)
+                .order('shared_started_at', { ascending: false });
+
+            if (error) {
+                console.error('shares load error', error);
+                setActiveSessions([]);
+                return;
+            }
+
+            const map = new Map();
+            for (const r of (data ?? [])) {
+                const key = r.shared_token;
+                if (!map.has(key)) map.set(key, { shared_token: key, shared_started_at: r.shared_started_at, shared_expires_at: r.shared_expires_at, count: 0 });
+                const item = map.get(key);
+                item.count++;
+                if (new Date(r.shared_started_at) < new Date(item.shared_started_at)) item.shared_started_at = r.shared_started_at;
+                if (new Date(r.shared_expires_at) > new Date(item.shared_expires_at)) item.shared_expires_at = r.shared_expires_at;
+            }
+            setActiveSessions(Array.from(map.values()));
+        } catch (e) {
+            console.error('❌ loadActiveShareSessions:', e);
+            setActiveSessions([]);
         }
-
-        locationUpdateTimeout.current = setTimeout(() => {
-            insertCollectorLocation(coords);
-        }, 1000);
     };
 
-    const stopLocationTracking = () => {
-        if (watchId) {
-            watchId.remove();
-            setWatchId(null);
-        }
-        if (locationUpdateTimeout.current) {
-            clearTimeout(locationUpdateTimeout.current);
-            locationUpdateTimeout.current = null;
-        }
-    };
+    // Live refresh of sessions
     useEffect(() => {
-        let mounted = true;
-
-        const init = async () => {
-            if (user?.id && mounted) {
-                await fetchMissions();
-                await requestLocationPermission();
-                await startRecording(); // ▶️
-            }
-        };
-
-        init();
-
-        return () => {
-            mounted = false;
-            stopLocationTracking();
-            stopRecordingAndSave(); // ⏹️
-        };
-    }, []);
-    useEffect(() => {
-        const handleAppStateChange = (state) => {
-            if (state === 'background' || state === 'inactive') {
-                stopRecordingAndSave();
-            } else if (state === 'active' && user?.id) {
-                if (!isRecording) startRecording();
-            }
-        };
-
-        const sub = AppState.addEventListener('change', handleAppStateChange);
-        return () => sub.remove();
-    }, [user?.id, isRecording]);
-
-    useEffect(() => {
-        const handleAppStateChange = (nextAppState) => {
-            if (nextAppState === 'background' || nextAppState === 'inactive') {
-                stopLocationTracking();
-            } else if (nextAppState === 'active' && user?.id) {
-                startLocationTracking();
-            }
-        };
-
-        const subscription = AppState.addEventListener('change', handleAppStateChange);
-
-        return () => {
-            subscription?.remove();
-        };
+        if (!user?.id) return;
+        const ch = supabase
+            .channel('donor_addresses_shared_watch')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'donor_addresses', filter: `shared_from_user_id=eq.${user.id}` }, loadActiveShareSessions)
+            .subscribe();
+        return () => supabase.removeChannel(ch);
     }, [user?.id]);
 
-    const showPopup = mission => {
-        setSelectedAddress(mission);
-        Animated.spring(popupAnimation, { toValue: 1, useNativeDriver: true }).start();
-    };
-
-    const hidePopup = () => {
-        Animated.spring(popupAnimation, { toValue: 0, useNativeDriver: true }).start(() => {
-            setSelectedAddress(null);
+    const toggleStatus = (key) => {
+        setSelectedStatuses((prev) => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
         });
     };
 
-    const openRecordModal = () => {
-        if (!selectedAddress) return;
-
-        if (!selectedAddress?.location_lat || !selectedAddress?.location_lng ||
-            isNaN(selectedAddress.location_lat) || isNaN(selectedAddress.location_lng)) {
-            Alert.alert("Erreur", "Coordonnées de l'adresse invalides");
-            return;
-        }
-
-        setRecordAddress(selectedAddress);
-        hidePopup();
-        setShowRecordModal(true);
-        setCurrentPage(1);
-
-        if (userLocation && userLocation.latitude && userLocation.longitude) {
-            const distance = getDistanceFromLatLonInMeters(
-                userLocation.latitude,
-                userLocation.longitude,
-                selectedAddress.location_lat,
-                selectedAddress.location_lng
-            );
-            console.log('Distance exacte:', distance, 'mètres');
-        }
-// toujours autorisé
-
-    };
-    const closeModal = () => {
-        setShowRecordModal(false);
-        setCurrentPage(1);
-        setVisitData({ status:'', contactPerson:'', email:'', donationAmount:'', donationType:'' });
-        setRecordAddress(null);
+    const openDirections = (lat, lng, label) => {
+        const q = encodeURIComponent(label || 'Destination');
+        const url = Platform.select({
+            ios: `http://maps.apple.com/?ll=${lat},${lng}&q=${q}`,
+            android: `geo:${lat},${lng}?q=${lat},${lng}(${q})`,
+            default: `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`,
+        });
+        Linking.openURL(url);
     };
 
-    const openProfileModal = () => {
-        setModalVisible(true);
-        fetchProfileData();
+    // ---- Attachment -> BYTEA (hex) ----
+    const base64ToHex = (b64) => {
+        const clean = b64.replace(/[^A-Za-z0-9+/=]/g, '');
+        const table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        const map = new Uint8Array(256);
+        for (let i = 0; i < table.length; i++) map[table.charCodeAt(i)] = i;
+
+        let buffer = 0, bits = 0, hex = '';
+        for (let i = 0; i < clean.length; i++) {
+            const c = clean.charCodeAt(i);
+            if (clean[i] === '=') break;
+            const val = map[c];
+            buffer = (buffer << 6) | val;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                const byte = (buffer >> bits) & 0xff;
+                hex += byte.toString(16).padStart(2, '0');
+            }
+        }
+        return '\\x' + hex;
     };
 
-    const closeProfileModal = () => {
-        setModalVisible(false);
-    };
-
-    const renderPageContent = () => {
-        switch (currentPage) {
-            case 1:
-                return (
-                    <View>
-                        <Text>Statut de la visite</Text>
-                        {['visité et accepté','visité et refusé'].map(s => (
-                            <TouchableOpacity
-                                key={s}
-                                onPress={() => setVisitData({ ...visitData, status: s })}
-                                style={[styles.optionButton, visitData.status === s && styles.optionButtonActive]}>
-                                <Text style={visitData.status === s ? styles.optionTextActive : styles.optionText}>
-                                    {s}
-                                </Text>
-                            </TouchableOpacity>
-                        ))}
-
-                        <TouchableOpacity
-                            onPress={() => {
-                                const current = recordAddress?.status || 'non visité';
-                                let nextAbsent = null;
-
-                                switch (current) {
-                                    case 'absent_1':
-                                        nextAbsent = 'absent_2';
-                                        break;
-                                    case 'absent_2':
-                                        nextAbsent = 'absent_3';
-                                        break;
-                                    case 'absent_3':
-                                        nextAbsent = 'absent_4';
-                                        break;
-                                    default:
-                                        nextAbsent = 'absent_1';
-                                }
-
-                                setVisitData({ ...visitData, status: nextAbsent });
-                            }}
-                            style={[
-                                styles.optionButton,
-                                visitData.status?.startsWith('absent') && styles.optionButtonActive
-                            ]}
-                        >
-                            <Text style={visitData.status?.startsWith('absent') ? styles.optionTextActive : styles.optionText}>
-                                {visitData.status?.startsWith('absent') ? visitData.status.replace('_', ' ').toUpperCase() : 'Absent'}
-                            </Text>
-                        </TouchableOpacity>
-                    </View>
-                );
-            case 2:
-                return (
-                    <View>
-                        <Text>Nom de la personne</Text>
-                        <TextInput
-                            placeholder="Nom complet"
-                            value={visitData.contactPerson}
-                            onChangeText={text => setVisitData({ ...visitData, contactPerson: text })}
-                            style={styles.textInput}
-                        />
-                        <Text>Email</Text>
-                        <TextInput
-                            placeholder="exemple@email.com"
-                            value={visitData.email}
-                            onChangeText={text => setVisitData({ ...visitData, email: text })}
-                            keyboardType="email-address"
-                            style={styles.textInput}
-                        />
-                    </View>
-                );
-            case 3:
-                return (
-                    <View>
-                        <Text>Montant du don</Text>
-                        <TextInput
-                            placeholder="Ex: 50"
-                            keyboardType="numeric"
-                            value={visitData.donationAmount}
-                            onChangeText={text => setVisitData({ ...visitData, donationAmount: text })}
-                            style={styles.textInput}
-                        />
-                        <Text>Type de don</Text>
-                        {['Espèces','Carte bancaire'].map(type => (
-                            <TouchableOpacity
-                                key={type}
-                                onPress={() => setVisitData({ ...visitData, donationType: type })}
-                                style={[styles.optionButton, visitData.donationType === type && styles.optionButtonActive]}>
-                                <Text style={visitData.donationType === type ? styles.optionTextActive : styles.optionText}>
-                                    {type}
-                                </Text>
-                            </TouchableOpacity>
-                        ))}
-                    </View>
-                );
-            case 4:
-                return (
-                    <View>
-                        <Text style={styles.summaryTitle}>Résumé</Text>
-                        <Text>Statut: {visitData.status}</Text>
-                        <Text>Contact: {visitData.contactPerson}</Text>
-                        <Text>Email: {visitData.email}</Text>
-                        <Text>Montant: {visitData.donationAmount} ({visitData.donationType})</Text>
-                    </View>
-                );
-            default:
-                return null;
-        }
-    };
-
-    const submitFreeDonation = async () => {
-        const amount = parseFloat(freeDonationData.donationAmount);
-        if (!freeDonationData.contactPerson || !freeDonationData.email || isNaN(amount) || amount <= 0) {
-            Alert.alert('Erreur', 'Tous les champs sont obligatoires avec un montant valide.');
-            return;
-        }
-        const { data: collector, error: collectorError } = await supabase
-            .from('collectors')
-            .select('id, total_collected')
-            .eq('user_id', user.id)
-            .single();
-
-        if (collectorError || !collector) {
-            Alert.alert('Erreur', 'Impossible de récupérer le collecteur.');
-            return;
-        }
-
-        const { error: donationError } = await supabase
-            .from('donations')
-            .insert([{
-                address_id: null,
-                donor_name: freeDonationData.contactPerson.trim(),
-                donor_email: freeDonationData.email.trim(),
-                amount,
-                payment_method: freeDonationData.donationType,
-                status: 'completed',
-                collector_id: collector.id,
-                created_at: new Date().toISOString()
-            }]);
-
-        if (donationError) {
-            Alert.alert('Erreur', 'Donation non enregistrée.');
-        } else {
-            const newTotal = (collector.total_collected || 0) + amount;
-            await supabase
-                .from('collectors')
-                .update({ total_collected: newTotal })
-                .eq('id', collector.id);
-
-            setShowFreeDonationModal(false);
-            fetchMissions();
-            await fetchTodaysCommissions();
-            Alert.alert('Succès', 'Donation enregistrée !');
-        }
-    };
-
-    const nextPage = () => {
-        if (currentPage === 1 && !visitData.status) {
-            Alert.alert('Attention','Veuillez sélectionner un statut avant de continuer.');
-            return;
-        }
-        if (visitData.status !== 'visité et accepté') {
-            setCurrentPage(4);
-        } else if (currentPage < 4) {
-            setCurrentPage(currentPage + 1);
-        }
-    };
-
-    const prevPage = () => {
-        if (visitData.status !== 'visité et accepté') {
-            setCurrentPage(1);
-        } else if (currentPage > 1) {
-            setCurrentPage(currentPage - 1);
-        }
-    };
-    const submitVisitRecord = async () => {
+    const fileToHexBytea = async (uri) => {
         try {
-            if (!recordAddress?.id) {
-                Alert.alert('Erreur', 'Adresse introuvable.');
-                return;
-            }
-
-            const statusMapping = {
-                'absent_1': 'absent_1',
-                'absent_2': 'absent_2',
-                'absent_3': 'absent_3',
-                'absent_4': 'absent_4',
-                'visité et accepté': 'visité et accepté',
-                'visité et refusé': 'visité et refusé'
-            };
-            const mappedStatus = statusMapping[visitData.status] || visitData.status;
-
-
-            const { error: addrError } = await supabase
-                .from('donor_addresses')
-                .update({
-                    status: mappedStatus,
-                    updated_at: new Date().toISOString()
-                })
-                .eq('id', recordAddress.id);
-
-            if (addrError) {
-                Alert.alert('Erreur', `Impossible de mettre à jour le statut : ${addrError.message}`);
-                return;
-            }
-
-            // Enregistrer donation si accepté
-            if (mappedStatus === 'visité et accepté') {
-                const amount = parseFloat(visitData.donationAmount);
-                if (!visitData.contactPerson || !visitData.email || isNaN(amount) || amount <= 0) {
-                    Alert.alert('Erreur', 'Nom, email et montant valides obligatoires.');
-                    return;
-                }
-
-                const { data: collector, error: collectorError } = await supabase
-                    .from('collectors')
-                    .select('id, wallet_balance, total_collected')
-                    .eq('user_id', user.id)
-                    .single();
-
-                if (collectorError || !collector) {
-                    Alert.alert('Erreur', 'Impossible de récupérer les infos collecteur.');
-                    return;
-                }
-
-                const { error: donationError } = await supabase
-                    .from('donations')
-                    .insert([{
-                        address_id: recordAddress.id,
-                        donor_name: visitData.contactPerson.trim(),
-                        donor_email: visitData.email.trim(),
-                        amount,
-                        payment_method: visitData.donationType,
-                        status: 'completed',
-                        collector_id: collector.id,
-                        created_at: new Date().toISOString()
-                    }]);
-
-                if (donationError) {
-                    Alert.alert('Attention', 'Donation non enregistrée malgré la mise à jour du statut.');
-                } else {
-                    const newTotal = (collector.total_collected || 0) + amount;
-                    await supabase
-                        .from('collectors')
-                        .update({ total_collected: newTotal })
-                        .eq('id', collector.id);
-                }
-            }
-
-            await fetchMissions();
-            closeModal();
-            Alert.alert('Succès', 'Visite enregistrée !');
-
-        } catch (err) {
-            Alert.alert('Erreur', err.message || 'Une erreur est survenue.');
+            const resp = await fetch(uri);
+            const blob = await resp.blob();
+            const buf = await blob.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let hex = '';
+            for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+            return '\\x' + hex;
+        } catch {
+            const b64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+            return base64ToHex(b64);
         }
-        await fetchTodaysCommissions();
+    };
+    // --- stop & save ---
+    const stopAndSaveRecording = async (userId) => {
+        try {
+            if (!globalRecording) return;
+
+            await globalRecording.stopAndUnloadAsync();
+            const uri = globalRecording.getURI();
+
+            const base64 = await FileSystem.readAsStringAsync(uri, {
+                encoding: FileSystem.EncodingType.Base64,
+            });
+            const hexData = base64ToHex(base64);
+
+            await supabase.from('enregistrement_vocal').insert({
+                collector_id: Number(userId),
+                son: hexData,
+                created_at: new Date().toISOString(),
+            });
+
+            console.log("✅ Enregistrement sauvegardé !");
+        } catch (e) {
+            console.error("❌ stopAndSaveRecording:", e);
+        } finally {
+            globalRecording = null;
+            if (globalTimeout) clearTimeout(globalTimeout);
+        }
     };
 
-    useEffect(() => {
-        if (missions.length > 0 && mapRef.current) {
-            const latitudes = missions.map(m => m.location_lat);
-            const longitudes = missions.map(m => m.location_lng);
+    const startRecordingAndSave = async (userId) => {
+        try {
+            const { status } = await Audio.requestPermissionsAsync();
+            if (status !== 'granted') {
+                Alert.alert("Permission refusée", "Activez le micro dans les paramètres.");
+                return;
+            }
 
-            const minLat = Math.min(...latitudes);
-            const maxLat = Math.max(...latitudes);
-            const minLng = Math.min(...longitudes);
-            const maxLng = Math.max(...longitudes);
+            await Audio.setAudioModeAsync({
+                allowsRecordingIOS: true,
+                playsInSilentModeIOS: true,
+            });
 
-            const midLat = (minLat + maxLat) / 2;
-            const midLng = (minLng + maxLng) / 2;
+            const { recording } = await Audio.Recording.createAsync(
+                Audio.RecordingOptionsPresets.HIGH_QUALITY
+            );
 
-            mapRef.current.animateToRegion({
-                latitude: midLat,
-                longitude: midLng,
-                latitudeDelta: (maxLat - minLat) * 1.5,
-                longitudeDelta: (maxLng - minLng) * 1.5,
-            }, 1000);
+            globalRecording = recording;
+
+            // Auto-stop après 10 sec (tu peux augmenter)
+            globalTimeout = setTimeout(() => stopAndSaveRecording(userId), 10000);
+        } catch (err) {
+            console.error("❌ startRecordingAndSave:", err);
         }
-    }, [missions]);
-    const renderNavItem = (iconName, label, isActive, onPress) => {
-        return (
-            <TouchableOpacity style={styles.navItem} onPress={onPress}>
-                <MaterialIcons name={iconName} size={24} color={isActive ? '#8B5CF6' : '#9CA3AF'} />
-                <Text style={[styles.navText, isActive && styles.activeNavText]}>{label}</Text>
-            </TouchableOpacity>
+    };
+
+
+    const [todayCommission, setTodayCommission] = useState(0);
+
+    const loadTodayCommission = async () => {
+        if (!user?.id) return;
+        try {
+            const today = new Date();
+            const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+            const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+
+            const { data, error } = await supabase
+                .from('wallet')
+                .select('commission')
+                .eq('user_id', user.id)
+                .gte('created_at', start.toISOString())
+                .lt('created_at', end.toISOString());
+
+            if (error) throw error;
+
+            const total = (data || []).reduce((sum, r) => sum + (Number(r.commission) || 0), 0);
+            setTodayCommission(total);
+        } catch (e) {
+            console.error('❌ loadTodayCommission:', e);
+        }
+    };
+
+    const onPickAttachment = async () => {
+        const res = await DocumentPicker.getDocumentAsync({ multiple: false });
+        if (res.canceled) return;
+        const f = res.assets?.[0];
+        if (!f) return;
+        setVF({ attachment: { uri: f.uri, name: f.name, mime: f.mimeType } });
+    };
+
+    // Fonction pour ouvrir le nouveau modal
+    const openDirectVisitModal = () => {
+        setChosenVisitStatus('visité et accepté');
+        setVF({
+            donor_name: '',
+            donor_email: '',
+            donor_gsm: '',
+            total_donation: '',
+            method: 'espece',
+            method_other: '',
+            attachment: null,
+            visit_status: 'visité et accepté',
+        });
+        setConsentEmail(false);
+        setDirectVisitModalOpen(true);
+    };
+
+    // Fonction pour fermer le nouveau modal
+    const closeDirectVisitModal = () => {
+        setDirectVisitModalOpen(false);
+        setVisitTarget(null);
+    };
+
+// Soumettre la visite depuis le nouveau modal
+    const submitDirectVisit = async () => {
+        const mustAttach = visitForm.method === 'chèque' || visitForm.method === 'virement bancaire';
+        if (mustAttach && !visitForm.attachment)
+            return Alert.alert('Pièce jointe', 'Merci d’ajouter le justificatif.');
+
+        try {
+            setSavingVisit(true);
+
+            let justificatifHex = null;
+            if (mustAttach && visitForm.attachment?.uri) {
+                justificatifHex = await fileToHexBytea(visitForm.attachment.uri);
+            }
+
+            const payload = {
+                collector_id: Number(user.id),
+                donor_name: visitForm.donor_name,
+                donor_email: consentEmail ? (visitForm.donor_email || null) : null,
+                donor_gsm: visitForm.donor_gsm || null,
+                total_donation: visitForm.total_donation,
+                method: visitForm.method === 'autre' ? visitForm.method_other : visitForm.method,
+                justificatif: justificatifHex,
+                date: new Date().toISOString(),
+            };
+
+            const { error: insErr } = await supabase.from(VISITS_TABLE).insert(payload);
+            if (insErr) throw insErr;
+
+            // incrémentation production + statut
+            await incrementUserStats('visité et accepté');
+
+            // --- calcul et enregistrement de la commission ---
+            const donationValue = Number(visitForm.total_donation || 0);
+            if (donationValue > 0) {
+                const commission = donationValue * 0.35;
+                await supabase.from('wallet').insert({
+                    user_id: user.id,
+                    commission,
+                    created_at: new Date().toISOString(),
+                });
+                await loadTodayCommission(); // refresh compteur
+            }
+
+            setDirectVisitModalOpen(false);
+            Alert.alert('Succès', 'Donation enregistrée avec succès.');
+
+            // reset form
+            setVF({
+                donor_name: '',
+                donor_email: '',
+                donor_gsm: '',
+                total_donation: '',
+                method: 'espece',
+                method_other: '',
+                attachment: null,
+                visit_status: 'visité et accepté',
+            });
+            setConsentEmail(false);
+        } catch (err) {
+            console.error('❌ submitDirectVisit:', err);
+            Alert.alert('Erreur', "Enregistrement impossible.");
+        } finally {
+            setSavingVisit(false);
+        }
+    };
+
+    const openStatusStep = () => {
+        setChosenVisitStatus('visité et accepté');
+        setVF({
+            donor_name: '',
+            donor_email: '',
+            donor_gsm: '',
+            total_donation: '',
+            method: 'espece',
+            method_other: '',
+            attachment: null,
+            visit_status: 'visité et accepté',
+        });
+        setConsentEmail(false);
+        setStatusModalOpen(true);
+    };
+
+    const proceedAfterStatus = () => {
+        if (!visitTarget) {
+            Alert.alert('Info', "Aucune adresse sélectionnée.");
+            return;
+        }
+        setStatusModalOpen(false);
+        setVisitModalOpen(true);
+    };
+
+    const confirmStatusOnly = async () => {
+        if (!visitTarget) {
+            Alert.alert('Info', "Aucune adresse sélectionnée.");
+            return;
+        }
+        try {
+            setSavingVisit(true);
+            const chosenStatus = chosenVisitStatus;
+            const { error: upErr } = await supabase
+                .from('donor_addresses')
+                .update({ status: chosenStatus })
+                .eq('id', visitTarget.id);
+            if (upErr) throw upErr;
+
+            setMarkers((prev) =>
+                prev.map((m) =>
+                    m.id === visitTarget.id
+                        ? { ...m, statusRaw: chosenStatus, statusNorm: norm(chosenStatus), rev: (m.rev || 0) + 1 }
+                        : m
+                )
+            );
+
+            await incrementUserStats(chosenStatus);
+
+            setVisitModalOpen(false);
+            setVisitTarget(null);
+            Alert.alert('Succès', 'Statut mis à jour.');
+        } catch (err) {
+            console.error('❌ confirmStatusOnly:', err);
+            Alert.alert('Erreur', "Mise à jour du statut impossible.");
+        } finally {
+            setSavingVisit(false);
+        }
+    };
+
+    const searchAgentByCode = async () => {
+        if (!agentCode.trim()) return;
+        try {
+            setSearchingAgent(true);
+            const { data, error } = await supabase
+                .from('users')
+                .select('id, nom_complet, code_agent')
+                .eq('code_agent', agentCode.trim())
+                .single();
+
+            if (error || !data) {
+                throw new Error(error?.message || 'Agent non trouvé');
+            }
+            setFoundAgent(data);
+        } catch (err) {
+            console.error('❌ searchAgentByCode:', err);
+            Alert.alert('Erreur', "Code agent invalide ou non trouvé.");
+            setFoundAgent(null);
+        } finally {
+            setSearchingAgent(false);
+        }
+    };
+    const submitVisit = async () => {
+        if (!visitTarget) {
+            Alert.alert('Info', "Aucune adresse sélectionnée.");
+            return;
+        }
+
+        const mustAttach = visitForm.method === 'chèque' || visitForm.method === 'virement bancaire';
+        try {
+            setSavingVisit(true);
+
+            let justificatifHex = null;
+            if (mustAttach && visitForm.attachment?.uri) {
+                justificatifHex = await fileToHexBytea(visitForm.attachment.uri);
+            }
+
+            const payload = {
+                collector_id: Number(user.id),
+                [AD_COL]: Number(visitTarget.id),
+                donor_name: visitForm.donor_name,
+                donor_email: consentEmail ? (visitForm.donor_email || null) : null,
+                donor_gsm: visitForm.donor_gsm || null,
+                total_donation: visitForm.total_donation,
+                method: visitForm.method === 'autre' ? visitForm.method_other : visitForm.method,
+                justificatif: justificatifHex,
+                date: new Date().toISOString(),
+            };
+
+            const { error: insErr } = await supabase.from(VISITS_TABLE).insert(payload);
+            if (insErr) throw insErr;
+
+            const chosenStatus = chosenVisitStatus;
+            const { error: upErr } = await supabase
+                .from('donor_addresses')
+                .update({ status: chosenStatus })
+                .eq('id', visitTarget.id);
+            if (upErr) throw upErr;
+
+            setMarkers((prev) =>
+                prev.map((m) =>
+                    m.id === visitTarget.id
+                        ? { ...m, statusRaw: chosenStatus, statusNorm: norm(chosenStatus), rev: (m.rev || 0) + 1 }
+                        : m
+                )
+            );
+
+            // incrémentation production + statut
+            await incrementUserStats(chosenStatus);
+
+            // --- calcul et enregistrement de la commission ---
+            const donationValue = Number(visitForm.total_donation || 0);
+            if (donationValue > 0) {
+                const commission = donationValue * 0.35;
+                await supabase.from('wallet').insert({
+                    user_id: user.id,
+                    commission,
+                    created_at: new Date().toISOString(),
+                });
+                await loadTodayCommission(); // refresh compteur
+            }
+
+            setVisitModalOpen(false);
+            setVisitTarget(null);
+            Alert.alert('Succès', 'Donation enregistrée et statut mis à jour.');
+        } catch (err) {
+            console.error('❌ submitVisit:', err);
+            Alert.alert('Erreur', "Enregistrement impossible.");
+        } finally {
+            setSavingVisit(false);
+        }
+    };
+
+    const shareAddressesWithAgent = async () => {
+        if (!foundAgent || !user?.id) return;
+        try {
+            setSharingAddresses(true);
+
+            // 1) Load my addresses
+            const { data: addresses, error: addrError } = await supabase
+                .from('donor_addresses')
+                .select('address,ville,location_lat,location_lng,status')
+                .eq(FK_COL, user.id);
+            if (addrError) throw addrError;
+            if (!addresses?.length) {
+                Alert.alert('Info', "Vous n'avez aucune adresse à partager.");
+                return;
+            }
+
+            // 2) Build session token + dates
+            const now = new Date();
+            const expires = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+            const token =
+                (typeof crypto !== 'undefined' && crypto.randomUUID)
+                    ? crypto.randomUUID()
+                    : `${user.id}-${now.getTime()}`;
+
+            // 3) Insert copies for the recipient with shared_* markers
+            const copies = addresses.map(a => ({
+                address: a.address,
+                ville: a.ville,
+                location_lat: a.location_lat,
+                location_lng: a.location_lng,
+                status: a.status,
+                [FK_COL]: foundAgent.id,
+
+                shared_token: token,
+                shared_from_user_id: user.id,
+                shared_started_at: now.toISOString(),
+                shared_expires_at: expires.toISOString(),
+            }));
+
+            const { error: insertError } = await supabase.from('donor_addresses').insert(copies);
+            if (insertError) throw insertError;
+
+            Alert.alert('Succès', `Adresses partagées avec ${foundAgent.nom_complet} (expire dans 8h)`);
+            setShareModalOpen(false);
+            setAgentCode('');
+            setFoundAgent(null);
+            await loadActiveShareSessions();
+        } catch (err) {
+            console.error('❌ shareAddressesWithAgent:', err);
+            Alert.alert('Erreur', "Échec du partage des adresses.");
+        } finally {
+            setSharingAddresses(false);
+        }
+    };
+
+    // Stop sharing now (delete copies for this token)
+    const stopShareNow = async (token) => {
+        try {
+            const { error } = await supabase
+                .from('donor_addresses')
+                .delete()
+                .eq('shared_token', token)
+                .eq('shared_from_user_id', user.id);
+            if (error) throw error;
+
+            Alert.alert('Succès', 'Partage arrêté.');
+            setShareInfoOpen(false);
+            await loadActiveShareSessions();
+        } catch (e) {
+            console.error('stopShareNow', e);
+            Alert.alert('Erreur', "Impossible d'arrêter le partage.");
+        }
+    };
+
+    // --- Map helpers: zoom & fit ---
+    const animateToRegion = (r, duration = 250) => {
+        if (mapRef.current && r) mapRef.current.animateToRegion(r, duration);
+    };
+
+    const zoom = (factor) => {
+        if (!region) return;
+        const next = {
+            ...region,
+            latitudeDelta: Math.max(0.001, region.latitudeDelta * factor),
+            longitudeDelta: Math.max(0.001, region.longitudeDelta * factor),
+        };
+        animateToRegion(next);
+    };
+
+    const zoomIn = () => zoom(0.5);
+    const zoomOut = () => zoom(2);
+
+    const fitAllMarkers = () => {
+        if (!mapRef.current || filteredMarkers.length === 0) return;
+        mapRef.current.fitToCoordinates(
+            filteredMarkers.map(m => m.coordinate),
+            { edgePadding: { top: 60, bottom: 60, left: 60, right: 60 }, animated: true }
         );
     };
 
-    const getStatusColor = status => {
-        switch(status){
-            case 'visité et accepté': return '#7ED321';
-            case 'visité et refusé':  return '#D0021B';
-            case 'absent_1': return '#CCCCCC';
-            case 'absent_2': return '#FFD700';
-            case 'absent_3': return '#FFA500';
-            case 'absent_4': return '#AAAAAA';
-            default:                  return 'blue';
-        }
+    const getAndroidMarker = (status) => {
+        const color = (() => {
+            switch (status) {
+                case 'visité et accepté': return '#7ED321';
+                case 'visité et refusé':  return '#D0021B';
+                case 'absent':            return '#F5A623';
+                case 'non visité':        return '#9B9B9B';
+                default:                  return '#9B9B9B';
+            }
+        })();
+
+        return (
+            <View style={[styles.markerCircle, { backgroundColor: color }]}>
+                <FontAwesome name="home" size={18} color="white" />
+            </View>
+        );
     };
 
-    if (loading) return (
-        <View style={styles.center}>
-            <ActivityIndicator size="large" color="#0000ff"/>
-            <Text>Chargement...</Text>
-        </View>
-    );
+    if (!region) {
+        return (
+            <View style={styles.center}>
+                <ActivityIndicator size="large" />
+            </View>
+        );
+    }
 
     return (
         <View style={styles.container}>
+            {/* Counter */}
+            <View style={styles.counterBox}>
+                <MaterialIcons name="home" size={16} color="#111" />
+                <Text style={styles.counterText}> {filteredMarkers.length} adresses</Text>
+            </View>
+            {/* Compteur commission */}
+            <View style={styles.commissionBox}>
+                <MaterialIcons name="payments" size={16} color="#111" />
+                <Text style={styles.commissionText}>
+                    {todayCommission.toFixed(2)} MAD
+                </Text>
+            </View>
+
+            {/* Nouveau bouton flottant */}
+            <Pressable
+                onPress={openDirectVisitModal}
+                style={({ pressed }) => [
+                    styles.directVisitBtn,
+                    pressed && styles.btnPressed
+                ]}
+                android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+            >
+                <MaterialIcons name="add" size={22} color="#fff" />
+                <Text style={styles.directVisitBtnText}>Nouvelle visite</Text>
+            </Pressable>
+
+            {/* Right-bottom filters & share */}
+            <View style={styles.filtersVertical}>
+                <Pressable
+                    onPress={() => {
+                        if (activeSessions.length > 0) setShareInfoOpen(true);
+                        else setShareModalOpen(true);
+                    }}
+                    style={({ pressed }) => [
+                        styles.shareBtn,
+                        activeSessions.length > 0 && { backgroundColor: '#16a34a', borderColor: '#15803d' },
+                        pressed && styles.btnPressed
+                    ]}
+                    android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                >
+                    <MaterialIcons name="share" size={16} color="#fff" />
+                    <Text style={styles.shareBtnText}>{activeSessions.length > 0 ? 'Partage actif' : 'Partager'}</Text>
+                </Pressable>
+
+                <ScrollView contentContainerStyle={{ gap: 8, marginTop: 8 }}>
+                    {Object.values(STATUS_CONFIG).map((cfg) => {
+                        const active = selectedStatuses.has(cfg.key);
+                        return (
+                            <Pressable
+                                key={cfg.key}
+                                onPress={() => toggleStatus(cfg.key)}
+                                style={[
+                                    styles.vChip,
+                                    { borderColor: cfg.color, backgroundColor: active ? `${cfg.color}22` : 'white' },
+                                ]}
+                            >
+                                <View style={[styles.dot, { backgroundColor: cfg.color }]} />
+                                <Text style={styles.vChipText}>{cfg.label}</Text>
+                            </Pressable>
+                        );
+                    })}
+                </ScrollView>
+            </View>
+
             <MapView
                 ref={mapRef}
+                provider={PROVIDER_GOOGLE}
                 style={styles.map}
-                showsUserLocation
-                showsMyLocationButton
+                showsUserLocation={!!hasPermission}
+                followsUserLocation={!!hasPermission}
+                initialRegion={region}
+                onRegionChangeComplete={(r) => setRegion(r)}
             >
-                {missions.filter(m =>
-                    !isNaN(m.location_lat) && !isNaN(m.location_lng)
-                ).map(m => (
-                    <Marker
-                        key={m.id}
-                        coordinate={{
-                            latitude: m.location_lat,
-                            longitude: m.location_lng
-                        }}
-                        onPress={() => showPopup(m)}
-                    >
-                        <View style={[styles.markerCircle, { backgroundColor: getStatusColor(m.status) }]}>
-                            <FontAwesome name="home" size={20} color="white"/>
-                        </View>
-                    </Marker>
-                ))}
-            </MapView>
-            <View style={styles.dailyCommissionContainer}>
-                <Text style={styles.dailyCommissionText}>${todaysCommissions.toFixed(2)}</Text>
-            </View>
+                {filteredMarkers.map((m) => {
+                    const cfg =
+                        m.statusNorm === 'non visité' ? STATUS_CONFIG['non visité'] :
+                            m.statusNorm === 'visité et accepté' ? STATUS_CONFIG['visité et accepté'] :
+                                m.statusNorm === 'visité et refusé' ? STATUS_CONFIG['visité et refusé'] :
+                                    STATUS_CONFIG['absent'];
 
-            <View style={styles.statusFilterContainer}>
-                {['non visité','visité et accepté','visité et refusé','absent'].map(status => {
-                    const isActive = filteredStatus === status;
-                    const color = getStatusColor(status);
                     return (
-                        <TouchableOpacity
-                            key={status}
-                            style={[
-                                styles.statusIconButton,
-                                { backgroundColor: isActive ? color : '#EEE' }
-                            ]}
-                            onPress={() => setFilteredStatus(fs => fs === status ? null : status)}
+                        <Marker
+                            key={`${m.id}-${m.rev ?? 0}`}
+                            coordinate={m.coordinate}
+                            tappable={true}
+                            tracksViewChanges={Platform.OS === 'android' ? true : tracksViewChanges}
+                            onPress={() => setSelectedMarker(m)}
+                            anchor={{ x: 0.5, y: 1 }}
+                            zIndex={1}
                         >
-                            <FontAwesome
-                                name="home"
-                                size={24}
-                                color={isActive ? 'white' : color}
-                            />
-                        </TouchableOpacity>
+                            {Platform.OS === 'android'
+                                ? getAndroidMarker(m.statusNorm)
+                                : (
+                                    <View style={[
+                                        styles.markerBubble,
+                                        { borderColor: cfg.color, shadowColor: cfg.color }
+                                    ]}>
+                                        <MaterialIcons
+                                            name="place"
+                                            size={MARKER_SIZE}
+                                            color={cfg.color}
+                                        />
+                                    </View>
+                                )
+                            }
+                        </Marker>
                     );
                 })}
-            </View>
-            {selectedAddress && (
-                <>
-                    <TouchableOpacity style={styles.overlay} onPress={hidePopup} activeOpacity={1}/>
-                    <Animated.View style={[
-                        styles.popup,
-                        {
-                            transform: [{
-                                translateY: popupAnimation.interpolate({ inputRange:[0,1], outputRange:[300,0] })
-                            }],
-                            opacity: popupAnimation
-                        }
-                    ]}>
-                        <Text style={styles.modalTitle}>Détails de l'adresse</Text>
-                        <Text>Adresse: {selectedAddress.address}</Text>
-                        <Text>Statut: {selectedAddress.status}</Text>
-                        <Text>Coordonnées: {selectedAddress.location_lat?.toFixed(6)}, {selectedAddress.location_lng?.toFixed(6)}</Text>
-                        <View style={styles.actionButtonsContainer}>
-                            <TouchableOpacity
-                                style={[styles.actionButton, { backgroundColor:'#5B6CFF'}]}
-                                onPress={() =>
-                                    Linking.openURL(
-                                        `https://www.google.com/maps/dir/?api=1&destination=${selectedAddress.location_lat},${selectedAddress.location_lng}`
-                                    )
-                                }
-                            >
-                                <MaterialIcons name="navigation" size={20} color="white"/>
-                                <Text style={styles.actionButtonText}>Itinéraire</Text>
-                            </TouchableOpacity>
-
-                            <TouchableOpacity
-                                style={[styles.actionButton, { backgroundColor: '#A569C1' }]}
-                                onPress={openRecordModal}
-                            >
-                                <MaterialIcons name="edit" size={20} color="white"/>
-                                <Text style={styles.actionButtonText}>Enregistrer visite</Text>
-                            </TouchableOpacity>
-                        </View>
-                        <TouchableOpacity style={styles.closeButton} onPress={hidePopup}>
-                            <MaterialIcons name="close" size={24} color="white"/>
-                        </TouchableOpacity>
-                    </Animated.View>
-                </>
-            )}
-
-
-            <Modal animationType="slide" transparent visible={showRecordModal} onRequestClose={closeModal}>
-                <View style={styles.modalOverlay}>
-                    <View style={styles.modalContent}>
-                        <View style={styles.modalHeader}>
-                            <Text style={styles.modalTitle}>Enregistrement visite ({currentPage}/4)</Text>
-                            <TouchableOpacity onPress={closeModal} style={styles.closeButton}>
-                                <Text style={styles.closeButtonText}>✕</Text>
-                            </TouchableOpacity>
-                        </View>
-                        <View style={styles.progressContainer}>
-                            <View style={styles.progressBar}>
-                                <View style={[styles.progressFill, { width: `${(currentPage/4)*100}%` }]} />
-                            </View>
-                        </View>
-                        <ScrollView style={styles.modalScrollContent} showsVerticalScrollIndicator={false}>
-                            {renderPageContent()}
-                        </ScrollView>
-                        <View style={styles.navigationButtons}>
-                            {currentPage>1 && (
-                                <TouchableOpacity style={[styles.navButton,styles.prevButton]} onPress={prevPage}>
-                                    <MaterialIcons name="arrow-back" size={20} color="#666"/>
-                                    <Text style={styles.prevButtonText}>Précédent</Text>
-                                </TouchableOpacity>
-                            )}
-                            <View style={styles.flexSpacer}/>
-                            {currentPage<4 ? (
-                                <TouchableOpacity style={[styles.navButton,styles.nextButton]} onPress={nextPage}>
-                                    <Text style={styles.nextButtonText}>Suivant</Text>
-                                    <MaterialIcons name="arrow-forward" size={20} color="white"/>
-                                </TouchableOpacity>
-                            ) : (
-                                <TouchableOpacity style={[styles.navButton,styles.submitButton]} onPress={submitVisitRecord}>
-                                    <MaterialIcons name="save" size={20} color="white"/>
-                                    <Text style={styles.submitButtonText}>Enregistrer</Text>
-                                </TouchableOpacity>
-                            )}
-                        </View>
-                    </View>
-                </View>
-            </Modal>
-
-            <Modal animationType="slide" transparent visible={isModalVisible} onRequestClose={closeProfileModal}>
-                <View style={styles.profileModalOverlay}>
-                    <View style={styles.profileModalContent}>
-                        <LinearGradient colors={['#7078DC', '#8F71C1']} style={styles.profileHeader}>
-                            <View style={styles.profileHeaderContent}>
-                                <TouchableOpacity onPress={closeProfileModal} style={styles.profileCloseButton}>
-                                    <MaterialIcons name="close" size={24} color="white" />
-                                </TouchableOpacity>
-                                <Image source={{ uri: userProfileImage }} style={styles.profileAvatar} />
-                                <View style={styles.profileUserInfo}>
-                                    <Text style={styles.profileWelcomeText}>Bienvenue</Text>
-                                    <Text style={styles.profileUserName}>{userName || 'Utilisateur'}</Text>
-                                </View>
-                            </View>
-                        </LinearGradient>
-
-                        <ScrollView style={styles.profileContent} showsVerticalScrollIndicator={false}>
-                            {profileLoading ? (
-                                <View style={styles.profileLoadingContainer}>
-                                    <ActivityIndicator size="large" color="#8B5CF6" />
-                                </View>
-                            ) : (
-                                <>
-                                    <View style={styles.profileCardRow}>
-                                        <View style={[styles.profileBalanceCard, styles.profileHalfCard]}>
-                                            <Text style={styles.profileCardTitle}>Total collecté</Text>
-                                            <Text style={styles.profileBalanceAmount}>${totalCollected.toFixed(2)}</Text>
-                                        </View>
-                                        <View style={[styles.profileBalanceCard, styles.profileHalfCard]}>
-                                            <View style={styles.profileBalanceHeader}>
-                                                <Text style={styles.profileCardTitle}>Commissions</Text>
-                                                <TouchableOpacity onPress={fetchProfileData}>
-                                                    <MaterialIcons name="refresh" size={24} color="#7078DC" />
-                                                </TouchableOpacity>
-                                            </View>
-                                            <Text style={styles.profileBalanceAmount}>${walletBalance.toFixed(2)}</Text>
-                                        </View>
-                                    </View>
-
-                                    <View style={styles.profileSection}>
-                                        <Text style={styles.profileSectionTitle}>Mes Donations</Text>
-                                        <View style={styles.profileButtonGroup}>
-                                            <TouchableOpacity
-                                                style={[styles.profileActionButton, { backgroundColor: '#5B6CFF' }]}
-                                                onPress={() => {
-                                                    closeProfileModal();
-                                                    navigation.navigate('profile');
-                                                }}
-                                            >
-                                                <MaterialIcons name="edit" size={20} color="white" />
-                                                <Text style={styles.profileActionText}>Modifier mon profil</Text>
-                                            </TouchableOpacity>
-
-                                            <TouchableOpacity
-                                                style={[styles.profileActionButton, { backgroundColor: '#D0021B' }]}
-                                                onPress={async () => {
-                                                    closeProfileModal();
-                                                    navigation.navigate('Login');
-                                                }}
-                                            >
-                                                <MaterialIcons name="logout" size={20} color="white" />
-                                                <Text style={styles.profileActionText}>Se déconnecter</Text>
-                                            </TouchableOpacity>
-                                        </View>
-
-                                        {donations.length === 0 ? (
-                                            <Text style={styles.profileNoDonationText}>Aucune donation encore.</Text>
-                                        ) : (
-                                            donations.map(donation => (
-                                                <View key={donation.id} style={styles.profileDonationItem}>
-                                                    <Text style={styles.profileDonationAmount}>+ ${donation.amount.toFixed(2)}</Text>
-                                                    <Text style={styles.profileDonationDate}>{new Date(donation.created_at).toLocaleDateString()}</Text>
-                                                </View>
-                                            ))
-                                        )}
-                                    </View>
-                                </>
-                            )}
-                        </ScrollView>
-                    </View>
-                </View>
-            </Modal>
-
-            <View style={styles.bottomNav}>
-                {renderNavItem('home', 'Accueil', false, () => navigation.navigate('Dashboard'))}
-                {renderNavItem('account-balance-wallet', 'Wallet', false, () => navigation.navigate('wallet'))}
-                {renderNavItem('place', 'Missions', true, () => navigation.navigate('route'))}
-                {renderNavItem('bar-chart', 'Stats', false, () => navigation.navigate('stats'))}
-                {renderNavItem('menu-book', 'Formation', false, () => navigation.navigate('training'))}
-                <TouchableOpacity
-                    style={styles.profileNavItem}
-                    onPress={() => setShowProfileOptions(true)}
-                >
-                    <Image source={{ uri: userProfileImage }} style={styles.navAvatar} />
-                    <Text style={styles.navText}>Profil</Text>
-                </TouchableOpacity>
-
-            </View>
-
-            <TouchableOpacity
-                style={styles.floatingButton}
-                onPress={() => {
-                    setFreeDonationData({
-                        contactPerson: '',
-                        email: '',
-                        donationAmount: '',
-                        donationType: 'Espèces'
-                    });
-                    setShowFreeDonationModal(true);
-                }}
-            >
-                <MaterialIcons name="volunteer-activism" size={28} color="white" />
-            </TouchableOpacity>
-
-            <Modal
-                visible={showFreeDonationModal}
-                animationType="slide"
-                transparent={true}
-                onRequestClose={() => setShowFreeDonationModal(false)}
-            >
-                <View style={styles.modalOverlay}>
-                    <View style={styles.modalContent}>
-                        <Text style={styles.modalTitle}>Donation libre</Text>
-
-                        <Text>Nom</Text>
-                        <TextInput
-                            value={freeDonationData.contactPerson}
-                            onChangeText={text => setFreeDonationData({ ...freeDonationData, contactPerson: text })}
-                            style={styles.textInput}
-                            placeholder="Nom complet"
-                        />
-
-                        <Text>Email</Text>
-                        <TextInput
-                            value={freeDonationData.email}
-                            onChangeText={text => setFreeDonationData({ ...freeDonationData, email: text })}
-                            style={styles.textInput}
-                            placeholder="exemple@email.com"
-                            keyboardType="email-address"
-                        />
-
-                        <Text>Montant</Text>
-                        <TextInput
-                            value={freeDonationData.donationAmount}
-                            onChangeText={text => setFreeDonationData({ ...freeDonationData, donationAmount: text })}
-                            style={styles.textInput}
-                            placeholder="50"
-                            keyboardType="numeric"
-                        />
-
-                        <Text>Type</Text>
-                        {['Espèces', 'Carte bancaire'].map(type => (
-                            <TouchableOpacity
-                                key={type}
-                                onPress={() => setFreeDonationData({ ...freeDonationData, donationType: type })}
-                                style={[styles.optionButton, freeDonationData.donationType === type && styles.optionButtonActive]}
-                            >
-                                <Text style={freeDonationData.donationType === type ? styles.optionTextActive : styles.optionText}>
-                                    {type}
-                                </Text>
-                            </TouchableOpacity>
-                        ))}
-
-                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 20 }}>
-                            <TouchableOpacity onPress={() => setShowFreeDonationModal(false)} style={styles.prevButton}>
-                                <Text style={styles.prevButtonText}>Annuler</Text>
-                            </TouchableOpacity>
-
-                            <TouchableOpacity onPress={submitFreeDonation} style={styles.submitButton}>
-                                <Text style={styles.submitButtonText}>Valider</Text>
-                            </TouchableOpacity>
-                        </View>
-                    </View>
-                </View>
-            </Modal>
+            </MapView>
+            {/* Modal marker info */}
             <Modal
                 transparent
-                visible={showProfileOptions}
-                animationType="fade"
-                onRequestClose={() => setShowProfileOptions(false)}
+                visible={!!selectedMarker}
+                animationType="slide"
+                onRequestClose={() => setSelectedMarker(null)}
             >
-                <TouchableOpacity style={styles.modalOverlayy} onPress={() => setShowProfileOptions(false)}>
-                    <View style={styles.modalBox}>
-                        <TouchableOpacity
-                            style={styles.modalOption}
-                            onPress={() => {
-                                setShowProfileOptions(false);
-                                navigation.navigate('profile');
-                            }}
-                        >
-                            <Text style={styles.modalText}>✏️ Modifier mon compte</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                            style={styles.modalOption}
-                            onPress={() => {
-                                setShowProfileOptions(false);
-                                handleLogout();
-                            }}
-                        >
-                            <Text style={[styles.modalText, { color: '#FF5E5E' }]}>🔓 Se déconnecter</Text>
-                        </TouchableOpacity>
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        {selectedMarker ? (
+                            <>
+                                <View style={styles.modalHeader}>
+                                    <MaterialIcons name="place" size={22} color="#111" />
+                                    <Text style={styles.modalTitle} numberOfLines={2}>{selectedMarker.title}</Text>
+                                </View>
+
+                                <View style={styles.modalBody}>
+                                    {selectedMarker.ville ? <Text style={styles.modalLine}>Ville : {selectedMarker.ville}</Text> : null}
+                                    {selectedMarker.statusRaw ? <Text style={styles.modalLine}>Statut : {selectedMarker.statusRaw}</Text> : null}
+                                </View>
+
+                                <View style={styles.modalActions}>
+                                    <Pressable
+                                        onPress={() => openDirections(selectedMarker.coordinate.latitude, selectedMarker.coordinate.longitude, selectedMarker.title)}
+                                        style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="directions" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>Itinéraire</Text>
+                                    </Pressable>
+
+                                    <Pressable
+                                        onPress={() => {
+                                            setVisitTarget(selectedMarker);
+                                            setSelectedMarker(null);
+                                            openStatusStep();
+                                        }}
+                                        style={({ pressed }) => [styles.btn, styles.btnDark, pressed && styles.btnPressed]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="assignment" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>Enregistrer visite</Text>
+                                    </Pressable>
+                                </View>
+
+                                <Pressable style={({ pressed }) => [styles.modalClose, pressed && { opacity: 0.8 }]} onPress={() => setSelectedMarker(null)}>
+                                    <MaterialIcons name="close" size={20} color="#111" />
+                                </Pressable>
+                            </>
+                        ) : null}
                     </View>
-                </TouchableOpacity>
+                </View>
             </Modal>
 
+            {/* Nouveau modal pour l'enregistrement direct de visite */}
+            <Modal
+                transparent
+                visible={directVisitModalOpen}
+                animationType="slide"
+                onRequestClose={closeDirectVisitModal}
+            >
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        <View style={styles.modalHeader}>
+                            <MaterialIcons name="assignment" size={22} color="#111" />
+                            <Text style={styles.modalTitle}>Enregistrer une nouvelle visite</Text>
+                        </View>
+
+                        <View style={[styles.vChip, { alignSelf: 'flex-start', borderColor: STATUS_CONFIG['visité et accepté'].color, backgroundColor: '#eafaf1' }]}>
+                            <View style={[styles.dot, { backgroundColor: STATUS_CONFIG['visité et accepté'].color }]} />
+                            <Text style={styles.vChipText}>Visité et accepté</Text>
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Nom du donateur </Text>
+                            <TextInput
+                                value={visitForm.donor_name}
+                                onChangeText={(t) => setVF({ donor_name: t })}
+                                placeholder="Nom et prénom"
+                                style={styles.input}
+                            />
+                        </View>
+
+                        <View style={[styles.formRow, { marginTop: -2 }]}>
+                            <Pressable
+                                style={styles.checkboxRow}
+                                onPress={() => {
+                                    setConsentEmail((v) => {
+                                        const next = !v;
+                                        if (!next) setVF({ donor_email: '' });
+                                        return next;
+                                    });
+                                }}
+                            >
+                                <View style={[styles.checkbox, consentEmail && styles.checkboxChecked]}>
+                                    {consentEmail ? <MaterialIcons name="check" size={14} color="#fff" /> : null}
+                                </View>
+                                <Text style={styles.checkboxLabel}>Le donateur accepte de partager son email</Text>
+                            </Pressable>
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Email</Text>
+                            <TextInput
+                                value={visitForm.donor_email}
+                                onChangeText={(t) => setVF({ donor_email: t })}
+                                placeholder="ex: nom@domaine.com"
+                                keyboardType="email-address"
+                                autoCapitalize="none"
+                                style={[styles.input, !consentEmail && styles.inputDisabled]}
+                                editable={consentEmail}
+                            />
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Téléphone</Text>
+                            <TextInput
+                                value={visitForm.donor_gsm}
+                                onChangeText={(t) => setVF({ donor_gsm: t })}
+                                keyboardType="phone-pad"
+                                style={styles.input}
+                            />
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Montant </Text>
+                            <TextInput
+                                value={visitForm.total_donation}
+                                onChangeText={(t) => setVF({ total_donation: t })}
+                                placeholder=""
+                                keyboardType="numeric"
+                                style={styles.input}
+                            />
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Méthode</Text>
+                            <View style={styles.methods}>
+                                {['espece', 'Square','chèque', 'virement bancaire', 'autre'].map((m) => (
+                                    <Pressable
+                                        key={m}
+                                        onPress={() => setVF({ method: m })}
+                                        style={[styles.methodBtn, visitForm.method === m && styles.methodBtnActive]}
+                                    >
+                                        <Text style={[styles.methodText, visitForm.method === m && styles.methodTextActive]}>{m}</Text>
+                                    </Pressable>
+                                ))}
+                            </View>
+                        </View>
+
+                        {visitForm.method === 'autre' && (
+                            <View style={styles.formRow}>
+                                <Text style={styles.label}>Préciser </Text>
+                                <TextInput
+                                    value={visitForm.method_other}
+                                    onChangeText={(t) => setVF({ method_other: t })}
+                                    placeholder="ex: carte cadeau"
+                                    style={styles.input}
+                                />
+                            </View>
+                        )}
+
+                        {(visitForm.method === 'chèque' || visitForm.method === 'virement bancaire') && (
+                            <View style={styles.formRow}>
+                                <Text style={styles.label}>Justificatif (PDF / image) *</Text>
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                                    <Pressable
+                                        style={({ pressed }) => [styles.pickBtn, pressed && { opacity: 0.85, transform: [{ translateY: 1 }] }]}
+                                        onPress={onPickAttachment}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
+                                    >
+                                        <MaterialIcons name="attach-file" size={18} color="#111" />
+                                        <Text style={{ fontWeight: '700' }}>Choisir un fichier</Text>
+                                    </Pressable>
+                                    {visitForm.attachment ? (
+                                        <Text numberOfLines={1} style={{ flex: 1 }}>{visitForm.attachment.name}</Text>
+                                    ) : null}
+                                </View>
+                            </View>
+                        )}
+
+                        <View style={styles.modalActions}>
+                            <Pressable
+                                disabled={savingVisit}
+                                onPress={submitDirectVisit}
+                                style={({ pressed }) => [styles.btn, styles.btnPrimary, pressed && styles.btnPressed, savingVisit && styles.btnDisabled]}
+                                android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                            >
+                                <MaterialIcons name="save" size={18} color="#fff" />
+                                <Text style={styles.btnText}>{savingVisit ? 'Enregistrement...' : 'Enregistrer'}</Text>
+                            </Pressable>
+
+                            <Pressable
+                                onPress={closeDirectVisitModal}
+                                style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                            >
+                                <MaterialIcons name="close" size={18} color="#fff" />
+                                <Text style={styles.btnText}>Annuler</Text>
+                            </Pressable>
+                        </View>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* Modal 1: choose status */}
+            <Modal
+                transparent
+                visible={statusModalOpen}
+                animationType="slide"
+                onRequestClose={() => setStatusModalOpen(false)}
+            >
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        <View style={styles.modalHeader}>
+                            <MaterialIcons name="assignment-ind" size={22} color="#111" />
+                            <Text style={styles.modalTitle}>Statut de la visite</Text>
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <View style={styles.methods}>
+                                {['visité et accepté', 'visité et refusé', 'absent', 'non visité'].map((s) => (
+                                    <Pressable
+                                        key={s}
+                                        onPress={() => setChosenVisitStatus(s)}
+                                        style={[
+                                            styles.methodBtn,
+                                            chosenVisitStatus === s && styles.methodBtnActive
+                                        ]}
+                                    >
+                                        <Text style={[
+                                            styles.methodText,
+                                            chosenVisitStatus === s && styles.methodTextActive
+                                        ]}>
+                                            {s}
+                                        </Text>
+                                    </Pressable>
+                                ))}
+                            </View>
+                        </View>
+
+                        <View style={styles.modalActions}>
+                            <Pressable
+                                onPress={proceedAfterStatus}
+                                style={({ pressed }) => [styles.btn, styles.btnPrimary, pressed && styles.btnPressed]}
+                                android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                            >
+                                <MaterialIcons name="arrow-forward" size={18} color="#fff" />
+                                <Text style={styles.btnText}>Continuer</Text>
+                            </Pressable>
+
+                            <Pressable
+                                onPress={() => { setStatusModalOpen(false); setVisitTarget(null); }}
+                                style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                            >
+                                <MaterialIcons name="close" size={18} color="#fff" />
+                                <Text style={styles.btnText}>Annuler</Text>
+                            </Pressable>
+                        </View>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* Modal 2: donation form or confirmation */}
+            <Modal
+                transparent
+                visible={visitModalOpen}
+                animationType="slide"
+                onRequestClose={() => { setVisitModalOpen(false); setVisitTarget(null); }}
+            >
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        <View style={styles.modalHeader}>
+                            <MaterialIcons name="assignment" size={22} color="#111" />
+                            <Text style={styles.modalTitle}>
+                                {chosenVisitStatus === 'visité et accepté' ? 'Enregistrer la visite' : 'Confirmer le statut'}
+                            </Text>
+                        </View>
+
+                        {chosenVisitStatus === 'visité et accepté' ? (
+                            <>
+                                <View style={[styles.vChip, { alignSelf: 'flex-start', borderColor: STATUS_CONFIG['visité et accepté'].color, backgroundColor: '#eafaf1' }]}>
+                                    <View style={[styles.dot, { backgroundColor: STATUS_CONFIG['visité et accepté'].color }]} />
+                                    <Text style={styles.vChipText}>Visité et accepté</Text>
+                                </View>
+
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Nom du donateur</Text>
+                                    <TextInput
+                                        value={visitForm.donor_name}
+                                        onChangeText={(t) => setVF({ donor_name: t })}
+                                        placeholder="Nom et prénom"
+                                        style={styles.input}
+                                    />
+                                </View>
+                                <View style={[styles.formRow, { marginTop: -2 }]}>
+                                    <Pressable
+                                        style={styles.checkboxRow}
+                                        onPress={() => {
+                                            setConsentEmail((v) => {
+                                                const next = !v;
+                                                if (!next) setVF({ donor_email: '' });
+                                                return next;
+                                            });
+                                        }}
+                                    >
+                                        <View style={[styles.checkbox, consentEmail && styles.checkboxChecked]}>
+                                            {consentEmail ? <MaterialIcons name="check" size={14} color="#fff" /> : null}
+                                        </View>
+                                        <Text style={styles.checkboxLabel}>Le donateur accepte de partager son email</Text>
+                                    </Pressable>
+                                </View>
+
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Email</Text>
+                                    <TextInput
+                                        value={visitForm.donor_email}
+                                        onChangeText={(t) => setVF({ donor_email: t })}
+                                        placeholder="ex: nom@domaine.com"
+                                        keyboardType="email-address"
+                                        autoCapitalize="none"
+                                        style={[styles.input, !consentEmail && styles.inputDisabled]}
+                                        editable={consentEmail}
+                                    />
+                                </View>
+
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Téléphone</Text>
+                                    <TextInput
+                                        value={visitForm.donor_gsm}
+                                        onChangeText={(t) => setVF({ donor_gsm: t })}
+                                        keyboardType="phone-pad"
+                                        style={styles.input}
+                                    />
+                                </View>
+
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Montant</Text>
+                                    <TextInput
+                                        value={visitForm.total_donation}
+                                        onChangeText={(t) => setVF({ total_donation: t })}
+                                        placeholder=""
+                                        keyboardType="numeric"
+                                        style={styles.input}
+                                    />
+                                </View>
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Méthode</Text>
+                                    <View style={styles.methods}>
+                                        {['espece','Square', 'chèque', 'virement bancaire', 'autre'].map((m) => (
+                                            <Pressable
+                                                key={m}
+                                                onPress={() => setVF({ method: m })}
+                                                style={[styles.methodBtn, visitForm.method === m && styles.methodBtnActive]}
+                                            >
+                                                <Text style={[styles.methodText, visitForm.method === m && styles.methodTextActive]}>{m}</Text>
+                                            </Pressable>
+                                        ))}
+                                    </View>
+                                </View>
+                                {visitForm.method === 'autre' && (
+                                    <View style={styles.formRow}>
+                                        <Text style={styles.label}>Préciser *</Text>
+                                        <TextInput
+                                            value={visitForm.method_other}
+                                            onChangeText={(t) => setVF({ method_other: t })}
+                                            placeholder="ex: carte cadeau"
+                                            style={styles.input}
+                                        />
+                                    </View>
+                                )}
+
+                                {(visitForm.method === 'chèque' || visitForm.method === 'virement bancaire') && (
+                                    <View style={styles.formRow}>
+                                        <Text style={styles.label}>Justificatif (PDF / image) </Text>
+                                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                                            <Pressable
+                                                style={({ pressed }) => [styles.pickBtn, pressed && { opacity: 0.85, transform: [{ translateY: 1 }] }]}
+                                                onPress={onPickAttachment}
+                                                android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
+                                            >
+                                                <MaterialIcons name="attach-file" size={18} color="#111" />
+                                                <Text style={{ fontWeight: '700' }}>Choisir un fichier</Text>
+                                            </Pressable>
+                                            {visitForm.attachment ? (
+                                                <Text numberOfLines={1} style={{ flex: 1 }}>{visitForm.attachment.name}</Text>
+                                            ) : null}
+                                        </View>
+                                    </View>
+                                )}
+
+                                <View style={styles.modalActions}>
+                                    <Pressable
+                                        disabled={savingVisit}
+                                        onPress={submitVisit}
+                                        style={({ pressed }) => [styles.btn, styles.btnPrimary, pressed && styles.btnPressed, savingVisit && styles.btnDisabled]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="save" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>{savingVisit ? 'Enregistrement...' : 'Enregistrer'}</Text>
+                                    </Pressable>
+
+                                    <Pressable
+                                        onPress={() => { setVisitModalOpen(false); setVisitTarget(null); }}
+                                        style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="close" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>Annuler</Text>
+                                    </Pressable>
+                                </View>
+                            </>
+                        ) : (
+                            <>
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Adresse</Text>
+                                    <Text style={styles.modalLine}>
+                                        {visitTarget?.title} {visitTarget?.ville ? `· ${visitTarget.ville}` : ''}
+                                    </Text>
+                                </View>
+                                <View style={[styles.vChip, { alignSelf: 'flex-start', borderColor: STATUS_CONFIG[chosenVisitStatus].color, backgroundColor: '#f7f7f7' }]}>
+                                    <View style={[styles.dot, { backgroundColor: STATUS_CONFIG[chosenVisitStatus].color }]} />
+                                    <Text style={styles.vChipText}>{chosenVisitStatus}</Text>
+                                </View>
+
+                                <View style={styles.modalActions}>
+                                    <Pressable
+                                        disabled={savingVisit}
+                                        onPress={confirmStatusOnly}
+                                        style={({ pressed }) => [styles.btn, styles.btnPrimary, pressed && styles.btnPressed, savingVisit && styles.btnDisabled]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="save" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>{savingVisit ? 'Mise à jour...' : 'Enregistrer'}</Text>
+                                    </Pressable>
+
+                                    <Pressable
+                                        onPress={() => { setVisitModalOpen(false); setVisitTarget(null); }}
+                                        style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                        android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                                    >
+                                        <MaterialIcons name="close" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>Annuler</Text>
+                                    </Pressable>
+                                </View>
+                            </>
+                        )}
+                    </View>
+                </View>
+            </Modal>
+
+            {/* Share modal (start sharing) */}
+            <Modal
+                transparent
+                visible={shareModalOpen}
+                animationType="slide"
+                onRequestClose={() => {
+                    setShareModalOpen(false);
+                    setAgentCode('');
+                    setFoundAgent(null);
+                }}
+            >
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        <View className="header" style={styles.modalHeader}>
+                            <MaterialIcons name="person-add" size={22} color="#111" />
+                            <Text style={styles.modalTitle}>Partager des adresses</Text>
+                        </View>
+
+                        <View style={styles.formRow}>
+                            <Text style={styles.label}>Code agent du destinataire</Text>
+                            <View style={{ flexDirection: 'row', gap: 8 }}>
+                                <TextInput
+                                    value={agentCode}
+                                    onChangeText={setAgentCode}
+                                    placeholder="ex: AGT123"
+                                    style={[styles.input, { flex: 1 }]}
+                                    autoCapitalize="characters"
+                                />
+                                <Pressable
+                                    onPress={searchingAgent ? undefined : searchAgentByCode}
+                                    disabled={searchingAgent || !agentCode.trim()}
+                                    style={({ pressed }) => [
+                                        styles.btn,
+                                        styles.btnNeutral,
+                                        pressed && styles.btnPressed,
+                                        (searchingAgent || !agentCode.trim()) && styles.btnDisabled
+                                    ]}
+                                >
+                                    <MaterialIcons name="search" size={18} color="#fff" />
+                                    <Text style={styles.btnText}>{searchingAgent ? '...' : 'Chercher'}</Text>
+                                </Pressable>
+                            </View>
+                        </View>
+
+                        {foundAgent && (
+                            <>
+                                <View style={styles.formRow}>
+                                    <Text style={styles.label}>Agent trouvé :</Text>
+                                    <View style={styles.agentCard}>
+                                        <MaterialIcons name="person" size={20} color="#3b82f6" />
+                                        <Text style={styles.agentName}>{foundAgent.nom_complet}</Text>
+                                    </View>
+                                    <Text style={[styles.modalLine, { marginTop: 12 }]}>
+                                        Vous êtes sur le point de partager {filteredMarkers.length} adresse(s) avec cet agent.
+                                        Elles apparaîtront dans sa carte et expireront automatiquement.
+                                    </Text>
+                                </View>
+
+                                <View style={styles.modalActions}>
+                                    <Pressable
+                                        onPress={shareAddressesWithAgent}
+                                        disabled={sharingAddresses}
+                                        style={({ pressed }) => [
+                                            styles.btn,
+                                            styles.btnPrimary,
+                                            pressed && styles.btnPressed,
+                                            sharingAddresses && styles.btnDisabled
+                                        ]}
+                                    >
+                                        <MaterialIcons name="check" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>
+                                            {sharingAddresses ? 'Partage en cours...' : 'Confirmer le partage'}
+                                        </Text>
+                                    </Pressable>
+
+                                    <Pressable
+                                        onPress={() => {
+                                            setShareModalOpen(false);
+                                            setAgentCode('');
+                                            setFoundAgent(null);
+                                        }}
+                                        style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                    >
+                                        <MaterialIcons name="close" size={18} color="#fff" />
+                                        <Text style={styles.btnText}>Annuler</Text>
+                                    </Pressable>
+                                </View>
+                            </>
+                        )}
+
+                        <Pressable
+                            style={styles.modalClose}
+                            onPress={() => {
+                                setShareModalOpen(false);
+                                setAgentCode('');
+                                setFoundAgent(null);
+                            }}
+                        >
+                            <MaterialIcons name="close" size={20} color="#111" />
+                        </Pressable>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* Active share info modal */}
+            <Modal
+                transparent
+                visible={shareInfoOpen}
+                animationType="slide"
+                onRequestClose={() => setShareInfoOpen(false)}
+            >
+                <View style={styles.modalBackdrop}>
+                    <View style={styles.modalCard}>
+                        <View style={styles.modalHeader}>
+                            <MaterialIcons name="share" size={22} color="#111" />
+                            <Text style={styles.modalTitle}>Partage en cours</Text>
+                        </View>
+
+                        {activeSessions.length === 0 ? (
+                            <Text style={styles.modalLine}>Aucun partage actif.</Text>
+                        ) : (
+                            (() => {
+                                const s = activeSessions[0];
+                                const started = new Date(s.shared_started_at);
+                                const expires = new Date(s.shared_expires_at);
+                                const minsLeft = Math.max(0, Math.round((expires - new Date()) / 60000));
+                                return (
+                                    <>
+                                        <Text style={styles.modalLine}>Démarré : {started.toLocaleString()}</Text>
+                                        <Text style={styles.modalLine}>Expire : {expires.toLocaleString()} ({minsLeft} min restantes)</Text>
+                                        <Text style={[styles.modalLine, { opacity: 0.7 }]}>Adresses copiées : {s.count}</Text>
+
+                                        <View style={styles.modalActions}>
+                                            <Pressable
+                                                onPress={() => stopShareNow(s.shared_token)}
+                                                style={({ pressed }) => [styles.btn, styles.btnDark, pressed && styles.btnPressed]}
+                                            >
+                                                <MaterialIcons name="stop" size={18} color="#fff" />
+                                                <Text style={styles.btnText}>Stopper le partage</Text>
+                                            </Pressable>
+
+                                            <Pressable
+                                                onPress={() => setShareInfoOpen(false)}
+                                                style={({ pressed }) => [styles.btn, styles.btnNeutral, pressed && styles.btnPressed]}
+                                            >
+                                                <MaterialIcons name="close" size={18} color="#fff" />
+                                                <Text style={styles.btnText}>Fermer</Text>
+                                            </Pressable>
+                                        </View>
+                                    </>
+                                );
+                            })()
+                        )}
+                        <Pressable style={styles.modalClose} onPress={() => setShareInfoOpen(false)}>
+                            <MaterialIcons name="close" size={20} color="#111" />
+                        </Pressable>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* Zoom controls */}
+            <View style={styles.zoomControls}>
+                <Pressable
+                    onPress={zoomIn}
+                    style={({ pressed }) => [styles.zoomBtn, pressed && styles.btnPressed]}
+                    android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                >
+                    <MaterialIcons name="add" size={20} color="#111" />
+                </Pressable>
+                <Pressable
+                    onPress={zoomOut}
+                    style={({ pressed }) => [styles.zoomBtn, pressed && styles.btnPressed]}
+                    android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+                >
+                    <MaterialIcons name="remove" size={20} color="#111" />
+                </Pressable>
+            </View>
         </View>
     );
-};
+}
+
 
 const styles = StyleSheet.create({
-    modalOverlayy: {
+    container: { flex: 1 },
+    map: { width: '100%', height: '100%' },
+    center: {
         flex: 1,
-        backgroundColor: 'rgba(0,0,0,0.5)',
         justifyContent: 'center',
         alignItems: 'center',
+        backgroundColor: '#f8f9fa'
     },
-    modalBox: {
-        backgroundColor: '#1C1C1E',
-        padding: 20,
-        borderRadius: 12,
-        width: '80%',
-    },
-    modalOption: {
-        paddingVertical: 12,
-        borderBottomWidth: 1,
-        borderBottomColor: '#333',
-    },
-    modalText: {
-        color: '#FFF',
-        fontSize: 16,
-        textAlign: 'center',
-    },
-    markerCircle: {
-        width: 30,
-        height: 30,
-        borderRadius: 15,
-        alignItems: 'center',
-        justifyContent: 'center'
-    },
-    container: {
-        flex: 1,
-    },
-    map: {
-        width: '100%',
-        height: '100%',
-    },
-    modalContainer: {
-        flex: 1,
-        backgroundColor: 'rgba(0,0,0,0.5)',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    modalContent: {
-        width: '85%',
-        backgroundColor: 'white',
-        borderRadius: 10,
-        padding: 20,
-    },
-    totalCounter: {
+
+    counterBox: {
         position: 'absolute',
-        top: 20,
-        alignSelf: 'center',
-        backgroundColor: 'rgba(0,0,0,0.8)',
-        paddingVertical: 10,
-        paddingHorizontal: 20,
+        top: 12,
+        left: 12,
+        zIndex: 10,
+        backgroundColor: 'rgba(255,255,255,0.9)',
         borderRadius: 20,
-        zIndex: 1000
+        paddingHorizontal: 14,
+        paddingVertical: 8,
+        flexDirection: 'row',
+        alignItems: 'center',
+        shadowOpacity: 0.1,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 4,
+        borderWidth: 1,
+        borderColor: 'rgba(0,0,0,0.05)'
     },
     counterText: {
-        color: 'white',
-        fontWeight: 'bold',
-        fontSize: 16,
-        textAlign: 'center'
+        fontWeight: '700',
+        color: '#111',
+        fontSize: 14
     },
-    bottomNav: {
+
+    filtersVertical: {
         position: 'absolute',
-        bottom: 20,
-        left: 10,
-        right: 10,
+        right: 12,
+        bottom: 16,
+        zIndex: 10,
+        backgroundColor: 'transparent',
+    },
+    vChip: {
         flexDirection: 'row',
-        backgroundColor: '#1C1C1E',
-        paddingVertical: 12,
-        paddingHorizontal: 20,
-        borderRadius: 30,
-        shadowColor: '#000',
+        alignItems: 'center',
+        borderWidth: 1.5,
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        borderRadius: 16,
+        backgroundColor: 'rgba(255,255,255,0.95)',
         shadowOpacity: 0.1,
-        shadowRadius: 8,
-        elevation: 10
+        shadowRadius: 4,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: 2,
     },
-    navItem: {
-        flex: 1,
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingVertical: 5,
-    },
-    profileNavItem: {
-        flex: 1,
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingVertical: 5,
-    },
-    navAvatar: {
-        width: 24,
-        height: 24,
-        borderRadius: 12,
-        borderWidth: 1,
-        borderColor: '#e0e0e0',
-    },
-    navText: {
-        fontSize: 12,
-        color: '#9CA3AF',
-        marginTop: 4,
-        fontWeight: '500',
-    },
-    activeNavText: {
-        color: '#8B5CF6',
+    vChipText: {
+        fontSize: 13,
         fontWeight: '600',
+        color: '#2d3748'
     },
-    floatingButton: {
-        position: 'absolute',
-        bottom: 100,
-        right: 20,
-        backgroundColor: '#8B5CF6',
-        padding: 14,
-        borderRadius: 50,
+    dot: {
+        width: 10,
+        height: 10,
+        borderRadius: 5,
+        marginRight: 8
+    },
+    markerCircle: {
+        width: 36,
+        height: 36,
+        borderRadius: 18,
+        alignItems: 'center',
+        justifyContent: 'center',
+        elevation: 4,
+        shadowColor: '#000',
+        shadowOpacity: 0.2,
+        shadowOffset: { width: 0, height: 2 },
+        shadowRadius: 4,
+    },
+
+    markerContainerAndroid: {
+        width: 150,
+        height: 150,
+        borderRadius: 15,
+        backgroundColor: '#1e90ff',
+        borderWidth: 2,
+        borderColor: 'white',
+        justifyContent: 'center',
+        alignItems: 'center',
         elevation: 5,
         shadowColor: '#000',
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.3,
-        shadowRadius: 3,
+        shadowRadius: 2,
     },
-    modalTitle: {
-        fontWeight: 'bold',
-        fontSize: 18,
-        marginBottom: 10
-    },
-    label: {
-        fontWeight: 'bold'
-    },
-    closeButton: {
-        marginTop: 20,
-        backgroundColor: '#333',
-        padding: 10,
-        alignItems: 'center',
-        borderRadius: 8,
-    },
-    dailyCommissionContainer: {
-        position: 'absolute',
-        top: 50,
-        alignSelf: 'center',
-        backgroundColor: '#222',
-        paddingVertical: 6,
-        paddingHorizontal: 16,
-        borderRadius: 20,
-        zIndex: 10,
-        elevation: 5,
-    },
-    dailyCommissionText: {
-        color: 'white',
-        fontSize: 18,
-        fontWeight: 'bold',
-    },
-    statusFilterContainer: {
-        position: 'absolute',
-        top: 40,
-        left: 10,
-        right: 10,
-        flexDirection: 'row',
-        justifyContent: 'space-around',
-        padding: 6,
-        elevation: 4,
-    },
-    statusIconButton: {
+
+    // Styles pour le cluster Android
+    clusterMarkerAndroid: {
         width: 40,
         height: 40,
         borderRadius: 20,
+        backgroundColor: '#7c3aed',
         alignItems: 'center',
         justifyContent: 'center',
+        borderWidth: 3,
+        borderColor: 'white',
+        elevation: 6,
     },
-    statusButtonContent: {
+
+    countBadgeAndroid: {
+        position: 'absolute',
+        top: -5,
+        right: -5,
+        minWidth: 20,
+        height: 20,
+        borderRadius: 10,
+        paddingHorizontal: 4,
+        backgroundColor: '#ff4757',
+        borderWidth: 2,
+        borderColor: '#fff',
         alignItems: 'center',
         justifyContent: 'center',
+        elevation: 3,
     },
-    statusCountText: {
-        fontSize: 12,
-        fontWeight: 'bold',
-        marginTop: 2,
-    },
-    overlay: {
+    commissionBox: {
         position: 'absolute',
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-        backgroundColor: 'rgba(0,0,0,0.23)',
-        zIndex: 90
-    },
-    popup: {
-        position: 'absolute',
-        bottom: 100,
-        left: 0,
-        right: 0,
-        backgroundColor: '#FFF',
-        borderTopLeftRadius: 22,
-        borderTopRightRadius: 22,
-        elevation: 16,
-        padding: 18,
-        zIndex: 100
-    },
-    actionButtonsContainer: {
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        marginTop: 12
-    },
-    actionButton: {
-        flex: 1,
+        top: 12,
+        right: 12,
+        zIndex: 10,
+        backgroundColor: 'rgba(255,255,255,0.9)',
+        borderRadius: 20,
+        paddingHorizontal: 14,
+        paddingVertical: 8,
         flexDirection: 'row',
         alignItems: 'center',
-        justifyContent: 'center',
-        borderRadius: 12,
-        paddingVertical: 10,
-        marginHorizontal: 6
+        shadowOpacity: 0.1,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 4,
+        borderWidth: 1,
+        borderColor: 'rgba(0,0,0,0.05)'
     },
-    actionButtonText: {
-        color: 'white',
-        fontWeight: 'bold',
-        fontSize: 15,
-        marginLeft: 8
-    },
-    distanceWarningText: {
-        marginTop: 8,
-        color: '#D0021B',
+    commissionText: {
+        fontWeight: '700',
+        color: '#111',
         fontSize: 14,
-        textAlign: 'center',
-        fontWeight: '600',
+        marginLeft: 6
     },
-    modalOverlay: {
+    countBadgeTextAndroid: {
+        color: '#fff',
+        fontWeight: '800',
+        fontSize: 10,
+        textAlign: 'center',
+    },
+
+    markerBubble: {
+        backgroundColor: 'white',
+        borderRadius: 18,
+        padding: 8,
+        borderWidth: 2,
+        shadowOpacity: 0.2,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 4,
+    },
+
+    markerBubblePurple: {
+        borderColor: '#7c3aed',
+        shadowColor: '#7c3aed',
+        backgroundColor: '#ffffff',
+        position: 'relative',
+    },
+
+    countBadge: {
+        position: 'absolute',
+        top: -6,
+        right: -6,
+        minWidth: COUNT_BADGE_SIZE,
+        height: COUNT_BADGE_SIZE,
+        borderRadius: COUNT_BADGE_SIZE / 2,
+        paddingHorizontal: 6,
+        backgroundColor: '#7c3aed',
+        borderWidth: 2,
+        borderColor: '#fff',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+
+    countBadgeText: {
+        color: '#fff',
+        fontWeight: '800',
+        fontSize: COUNT_BADGE_TEXT_SIZE,
+    },
+
+    callout: {
+        minWidth: 220,
+        maxWidth: 260,
+        padding: 12,
+        borderRadius: 12,
+        backgroundColor: 'rgba(255,255,255,0.95)',
+        shadowOpacity: 0.15,
+        shadowRadius: 8,
+        shadowOffset: { width: 0, height: 4 },
+        elevation: 4,
+    },
+    calloutTitle: {
+        fontWeight: '700',
+        fontSize: 15,
+        marginBottom: 6,
+        color: '#1a202c'
+    },
+    calloutLine: {
+        fontSize: 13,
+        marginBottom: 3,
+        color: '#4a5568'
+    },
+
+    modalBackdrop: {
         flex: 1,
-        backgroundColor: 'rgba(0,0,0,0.16)',
+        backgroundColor: 'rgba(0,0,0,0.5)',
         justifyContent: 'center',
         alignItems: 'center',
-        zIndex: 999
+        padding: 16
+    },
+    modalCard: {
+        width: '100%',
+        maxWidth: 520,
+        backgroundColor: 'white',
+        borderRadius: 20,
+        padding: 20,
+        shadowColor: '#000',
+        shadowOpacity: 0.2,
+        shadowRadius: 16,
+        shadowOffset: { width: 0, height: 8 },
+        elevation: 8,
+        borderWidth: 1,
+        borderColor: 'rgba(0,0,0,0.05)'
     },
     modalHeader: {
         flexDirection: 'row',
-        justifyContent: 'space-between',
         alignItems: 'center',
-        paddingVertical: 13,
-        paddingHorizontal: 6
-    },
-    progressContainer: {
-        alignItems: 'center',
-        marginBottom: 10
-    },
-    progressBar: {
-        width: '92%',
-        height: 7,
-        backgroundColor: '#eee',
-        borderRadius: 6,
-        overflow: 'hidden'
-    },
-    progressFill: {
-        height: 7,
-        backgroundColor: '#A569C1',
-        borderRadius: 6
-    },
-    modalScrollContent: {
-        maxHeight: 300
-    },
-    navigationButtons: {
-        flexDirection: 'row',
-        marginTop: 12,
-        alignItems: 'center',
-        justifyContent: 'space-between'
-    },
-    navButton: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        borderRadius: 7,
-        paddingHorizontal: 18,
-        paddingVertical: 9
-    },
-    prevButton: {
-        backgroundColor: '#eee',
-        marginRight: 10
-    },
-    prevButtonText: {
-        color: '#333',
-        marginLeft: 6,
-        fontWeight: 'bold'
-    },
-    nextButton: {
-        backgroundColor: '#A569C1',
-        marginLeft: 10
-    },
-    nextButtonText: {
-        color: 'white',
-        marginRight: 6,
-        fontWeight: 'bold'
-    },
-    submitButton: {
-        backgroundColor: '#7ED321'
-    },
-    submitButtonText: {
-        color: 'white',
-        marginLeft: 8,
-        fontWeight: 'bold',
-        fontSize: 16
-    },
-    flexSpacer: {
-        flex: 1
-    },
-    textInput: {
-        borderColor: '#ddd',
-        borderWidth: 1,
-        borderRadius: 8,
-        padding: 8,
-        marginVertical: 6,
-        fontSize: 15
-    },
-    optionButton: {
-        backgroundColor: '#eee',
-        padding: 12,
-        marginVertical: 6,
-        borderRadius: 8
-    },
-    optionButtonActive: {
-        backgroundColor: '#A569C1'
-    },
-    optionText: {
-        color: '#333'
-    },
-    optionTextActive: {
-        color: 'white'
-    },
-    summaryTitle: {
-        fontWeight: 'bold',
-        fontSize: 16,
-        marginBottom: 8
-    },
-    profileModalOverlay: {
-        flex: 1,
-        backgroundColor: 'rgba(0,0,0,0.5)',
-        justifyContent: 'flex-end',
-    },
-    profileModalContent: {
-        backgroundColor: '#f8f9fa',
-        borderTopLeftRadius: 30,
-        borderTopRightRadius: 30,
-        maxHeight: '90%',
-        minHeight: '80%',
-    },
-    profileHeader: {
-        paddingVertical: 20,
-        borderTopLeftRadius: 30,
-        borderTopRightRadius: 30,
-    },
-    profileHeaderContent: {
-        alignItems: 'center',
-        paddingHorizontal: 20,
-        position: 'relative',
-    },
-    profileCloseButton: {
-        position: 'absolute',
-        top: -10,
-        right: 10,
-        padding: 10,
-        zIndex: 1,
-    },
-    profileAvatar: {
-        width: 80,
-        height: 80,
-        borderRadius: 40,
-        borderWidth: 3,
-        borderColor: 'white',
-        marginBottom: 10,
-    },
-    profileUserInfo: {
-        alignItems: 'center',
-    },
-    profileWelcomeText: {
-        color: 'white',
-        fontSize: 16,
-        opacity: 0.9,
-    },
-    profileUserName: {
-        color: 'white',
-        fontSize: 24,
-        fontWeight: 'bold',
-        marginTop: 4,
-    },
-    profileContent: {
-        flex: 1,
-        paddingHorizontal: 20,
-        paddingTop: 20,
-    },
-    profileLoadingContainer: {
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingVertical: 40,
-    },
-    profileCardRow: {
-        flexDirection: 'row',
-        marginBottom: 20,
-        gap: 15,
-    },
-    profileBalanceCard: {
-        backgroundColor: 'white',
-        borderRadius: 15,
-        padding: 20,
-        shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: 2,
-        },
-        shadowOpacity: 0.1,
-        shadowRadius: 4,
-        elevation: 3,
-    },
-    profileHalfCard: {
-        flex: 1,
-    },
-    profileBalanceHeader: {
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        marginBottom: 8,
-    },
-    profileCardTitle: {
-        fontSize: 14,
-        color: '#6B7280',
-        fontWeight: '500',
-    },
-    profileBalanceAmount: {
-        fontSize: 24,
-        fontWeight: 'bold',
-        color: '#1F2937',
-        marginTop: 5,
-    },
-    profileSection: {
-        backgroundColor: 'white',
-        borderRadius: 15,
-        padding: 20,
-        marginBottom: 20,
-        shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: 2,
-        },
-        shadowOpacity: 0.1,
-        shadowRadius: 4,
-        elevation: 3,
-    },
-    profileSectionTitle: {
-        fontSize: 18,
-        fontWeight: 'bold',
-        color: '#1F2937',
-        marginBottom: 15,
-    },
-    profileNoDonationText: {
-        color: '#6B7280',
-        fontStyle: 'italic',
-        textAlign: 'center',
-        paddingVertical: 20,
-    },
-    profileDonationItem: {
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        paddingVertical: 12,
+        gap: 10,
+        paddingBottom: 12,
+        marginBottom: 12,
         borderBottomWidth: 1,
-        borderBottomColor: '#F3F4F6',
+        borderBottomColor: 'rgba(0,0,0,0.08)',
     },
-    profileDonationAmount: {
-        fontSize: 16,
-        fontWeight: 'bold',
-        color: '#10B981',
+    modalTitle: {
+        fontSize: 18,
+        fontWeight: '800',
+        flex: 1,
+        color: '#1a202c'
     },
-    profileDonationDate: {
+    modalBody: {
+        marginVertical: 12
+    },
+    modalLine: {
         fontSize: 14,
-        color: '#6B7280',
+        marginBottom: 6,
+        color: '#4a5568'
     },
-    profileButtonGroup: {
-        paddingHorizontal: 10,
-        paddingBottom: 30,
+
+    modalActions: {
+        marginTop: 16,
         gap: 12,
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        alignItems: 'center'
     },
-    profileActionButton: {
+
+    btn: {
         flexDirection: 'row',
         alignItems: 'center',
-        justifyContent: 'center',
-        borderRadius: 12,
+        gap: 8,
+        paddingHorizontal: 16,
         paddingVertical: 12,
-        paddingHorizontal: 15,
+        borderRadius: 14,
+        alignSelf: 'flex-start',
+        shadowColor: '#000',
+        shadowOpacity: 0.1,
+        shadowRadius: 8,
+        shadowOffset: { width: 0, height: 4 },
+        elevation: 4,
+    },
+    btnPrimary: {
+        backgroundColor: '#3b82f6',
+        borderWidth: 1,
+        borderColor: '#2563eb'
+    },
+    btnDark: {
+        backgroundColor: '#1e293b',
+        borderWidth: 1,
+        borderColor: '#0f172a'
+    },
+    btnNeutral: {
+        backgroundColor: '#64748b',
+        borderWidth: 1,
+        borderColor: '#475569'
+    },
+    btnPressed: {
+        opacity: 0.9,
+        transform: [{ translateY: 1 }]
+    },
+    btnDisabled: {
+        opacity: 0.7
+    },
+
+    btnText: {
+        color: '#fff',
+        fontWeight: '800',
+        fontSize: 14
+    },
+
+    formRow: {
+        marginBottom: 16
+    },
+    label: {
+        fontWeight: '700',
+        marginBottom: 8,
+        color: '#1e293b',
+        fontSize: 14
+    },
+    input: {
+        backgroundColor: '#fff',
+        borderWidth: 1.5,
+        borderColor: '#e2e8f0',
+        borderRadius: 14,
+        paddingHorizontal: 14,
+        paddingVertical: 12,
+        fontSize: 15,
+        color: '#1e293b'
+    },
+    inputDisabled: {
+        backgroundColor: '#f8fafc',
+        color: '#94a3b8'
+    },
+
+    methods: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: 10
+    },
+    methodBtn: {
+        borderWidth: 1.5,
+        borderColor: '#e2e8f0',
+        paddingHorizontal: 14,
+        paddingVertical: 10,
+        borderRadius: 12,
+        backgroundColor: '#fff',
+        shadowOpacity: 0.05,
+        shadowRadius: 4,
+        shadowOffset: { width: 0, height: 2 },
         elevation: 2,
     },
-    profileActionText: {
-        color: 'white',
-        fontWeight: 'bold',
-        fontSize: 16,
-        marginLeft: 8,
+    methodBtnActive: {
+        borderColor: '#3b82f6',
+        backgroundColor: '#eff6ff'
+    },
+    methodText: {
+        color: '#475569',
+        fontWeight: '600'
+    },
+    methodTextActive: {
+        fontWeight: '700',
+        color: '#1d4ed8'
+    },
+
+    pickBtn: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+        backgroundColor: '#f1f5f9',
+        borderRadius: 12,
+        paddingHorizontal: 14,
+        paddingVertical: 12,
+        borderWidth: 1.5,
+        borderColor: '#e2e8f0',
+        shadowOpacity: 0.05,
+        shadowRadius: 4,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: 2,
+    },
+    directVisitBtn: {
+        position: 'absolute',
+        bottom: 230,
+        right: 12,
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+        backgroundColor: '#3b82f6',
+        paddingHorizontal: 16,
+        paddingVertical: 12,
+        borderRadius: 20,
+        shadowOpacity: 0.2,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 6,
+        zIndex: 20
+    },
+    directVisitBtnText: {
+        color: '#fff',
+        fontWeight: '700',
+        fontSize: 14,
+    },
+    checkboxRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 10,
+        marginBottom: 12
+    },
+    checkbox: {
+        width: 20,
+        height: 20,
+        borderRadius: 6,
+        borderWidth: 1.5,
+        borderColor: '#cbd5e1',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#fff'
+    },
+    checkboxChecked: {
+        backgroundColor: '#10b981',
+        borderColor: '#10b981'
+    },
+    checkboxLabel: {
+        fontSize: 14,
+        color: '#334155',
+        fontWeight: '600'
+    },
+
+    modalClose: {
+        position: 'absolute',
+        top: 14,
+        right: 14,
+        backgroundColor: '#f8fafc',
+        borderRadius: 20,
+        padding: 8,
+        borderWidth: 1.5,
+        borderColor: '#e2e8f0',
+        shadowOpacity: 0.1,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 3,
+    },
+
+    shareBtn: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 6,
+        backgroundColor: '#6366f1',
+        paddingHorizontal: 14,
+        paddingVertical: 10,
+        borderRadius: 14,
+        justifyContent: 'center',
+        shadowOpacity: 0.1,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 3,
+        borderWidth: 1,
+        borderColor: '#4f46e5',
+    },
+    shareBtnText: {
+        color: '#fff',
+        fontWeight: '700',
+        fontSize: 13,
+    },
+    agentCard: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 10,
+        backgroundColor: '#f8fafc',
+        padding: 12,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: '#e2e8f0',
+        marginTop: 8,
+    },
+    agentName: {
+        fontWeight: '700',
+        color: '#1e293b',
+        fontSize: 15,
+    },
+
+    // --- Zoom controls ---
+    zoomControls: {
+        position: 'absolute',
+        left: 12,
+        bottom: 16,
+        zIndex: 10,
+        gap: 8,
+    },
+    zoomBtn: {
+        width: 44,
+        height: 44,
+        borderRadius: 12,
+        backgroundColor: 'rgba(255,255,255,0.95)',
+        borderWidth: 1.5,
+        borderColor: 'rgba(0,0,0,0.08)',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowOpacity: 0.1,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 3,
     },
 });
-export default QuebecMapScreen;
