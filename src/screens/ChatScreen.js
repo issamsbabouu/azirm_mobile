@@ -18,27 +18,31 @@ import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { supabase } from '../supabase';
 import { useAuth } from '../context/AuthContext';
 
-const { width, height } = Dimensions.get('window');
+const { width } = Dimensions.get('window');
 
 export default function ChatWithUsersScreen({ navigation }) {
     const { user } = useAuth();
 
-    // State for users list + search input
-    const [users, setUsers] = useState([]);
+    // Mode : "history" (conversations) or "new" (search users to start chat)
+    const [mode, setMode] = useState('history');
+
+    // States
     const [searchQuery, setSearchQuery] = useState('');
-    const [loadingUsers, setLoadingUsers] = useState(true);
+    const [loadingUsers, setLoadingUsers] = useState(false);
+    const [loadingConversations, setLoadingConversations] = useState(true);
+    const [users, setUsers] = useState([]);
+    const [conversations, setConversations] = useState([]);
 
-    // Selected chat user
+    // Chat
     const [selectedUser, setSelectedUser] = useState(null);
-
-    // Chat messages state
     const [messages, setMessages] = useState([]);
     const [loadingMessages, setLoadingMessages] = useState(false);
     const [newMessage, setNewMessage] = useState('');
     const [sending, setSending] = useState(false);
+
     const flatListRef = useRef(null);
 
-    // Fetch users from supabase (exclude current user)
+    // --- Chargement liste utilisateurs pour mode "new" ---
     const loadUsers = async () => {
         setLoadingUsers(true);
         try {
@@ -48,8 +52,9 @@ export default function ChatWithUsersScreen({ navigation }) {
                 .neq('id', user.id)
                 .ilike('nom_complet', `%${searchQuery}%`)
                 .order('nom_complet', { ascending: true });
+
             if (error) throw error;
-            setUsers(data);
+            setUsers(data || []);
         } catch (error) {
             console.error('Erreur chargement users:', error);
             Alert.alert('Erreur', 'Impossible de charger la liste des utilisateurs');
@@ -58,7 +63,79 @@ export default function ChatWithUsersScreen({ navigation }) {
         }
     };
 
-    // Fetch messages for selectedUser
+    // --- Chargement historique des conversations (dernier message par utilisateur) ---
+    const loadConversations = async () => {
+        setLoadingConversations(true);
+        try {
+            const { data, error } = await supabase
+                .from('conversation')
+                .select('*')
+                .or(`emetteur.eq.${user.id},receveur.eq.${user.id}`)
+                .order('created_at', { ascending: false });
+
+            if (error) throw error;
+
+            const messages = data || [];
+
+            // Map userId => last message with that user
+            const convMap = new Map();
+
+            messages.forEach((msg) => {
+                // Identifier l'autre utilisateur dans la conversation
+                const otherUserId = msg.emetteur === user.id ? msg.receveur : msg.emetteur;
+
+                // Si pas encore enregistré ou message plus récent
+                if (
+                    !convMap.has(otherUserId) ||
+                    new Date(msg.created_at) > new Date(convMap.get(otherUserId).created_at)
+                ) {
+                    convMap.set(otherUserId, msg);
+                }
+            });
+
+            // On récupère la liste des autres users pour afficher nom/photo
+            const otherUserIds = Array.from(convMap.keys());
+            if (otherUserIds.length === 0) {
+                setConversations([]);
+                setLoadingConversations(false);
+                return;
+            }
+
+            const { data: usersData, error: usersError } = await supabase
+                .from('users')
+                .select('id, nom_complet, photo')
+                .in('id', otherUserIds);
+
+            if (usersError) throw usersError;
+
+            // Construire tableau conversations
+            const convList = otherUserIds.map((id) => {
+                const lastMessage = convMap.get(id);
+                const userInfo = usersData.find((u) => u.id === id);
+
+                return {
+                    user: userInfo,
+                    lastMessage,
+                };
+            });
+
+            // Trier par date dernier message descendant
+            convList.sort(
+                (a, b) =>
+                    new Date(b.lastMessage.created_at).getTime() -
+                    new Date(a.lastMessage.created_at).getTime()
+            );
+
+            setConversations(convList);
+        } catch (error) {
+            console.error('Erreur chargement conversations:', error);
+            Alert.alert('Erreur', 'Impossible de charger les conversations');
+        } finally {
+            setLoadingConversations(false);
+        }
+    };
+
+    // --- Chargement messages d'une conversation ---
     const loadMessages = async (receiverId) => {
         if (!receiverId) return;
         setLoadingMessages(true);
@@ -82,49 +159,7 @@ export default function ChatWithUsersScreen({ navigation }) {
         }
     };
 
-    // Search users on query change (debounce could be added)
-    useEffect(() => {
-        loadUsers();
-    }, [searchQuery]);
-
-    // Reload messages when selectedUser changes
-    useEffect(() => {
-        if (selectedUser) {
-            loadMessages(selectedUser.id);
-        } else {
-            setMessages([]);
-        }
-    }, [selectedUser]);
-
-    // Listen for new messages realtime for the current conversation
-    useEffect(() => {
-        if (!selectedUser) return;
-
-        const channel = supabase
-            .channel('conversation_channel')
-            .on(
-                'postgres_changes',
-                {
-                    event: 'INSERT',
-                    schema: 'public',
-                    table: 'conversation',
-                    filter: `or(and(emetteur.eq.${user.id},receveur.eq.${selectedUser.id}),and(emetteur.eq.${selectedUser.id},receveur.eq.${user.id}))`,
-                },
-                (payload) => {
-                    setMessages((prev) => [...prev, payload.new]);
-                    setTimeout(() => {
-                        flatListRef.current?.scrollToEnd({ animated: true });
-                    }, 100);
-                }
-            )
-            .subscribe();
-
-        return () => {
-            supabase.removeChannel(channel);
-        };
-    }, [selectedUser, user.id]);
-
-    // Send message
+    // --- Envoi message ---
     const sendMessage = async () => {
         if (!newMessage.trim() || sending || !selectedUser) return;
 
@@ -133,16 +168,24 @@ export default function ChatWithUsersScreen({ navigation }) {
         setNewMessage('');
 
         try {
-            const { error } = await supabase.from('conversation').insert([
+            const { data, error } = await supabase.from('conversation').insert([
                 {
                     emetteur: user.id,
                     receveur: selectedUser.id,
                     message: messageText,
                     created_at: new Date().toISOString(),
                 },
-            ]);
+            ]).select();
 
             if (error) throw error;
+
+            // Add the new message to the state immediately for a responsive UI
+            if (data && data.length > 0) {
+                setMessages(prev => [...prev, data[0]]);
+                setTimeout(() => {
+                    flatListRef.current?.scrollToEnd({ animated: true });
+                }, 100);
+            }
         } catch (error) {
             console.error('Erreur envoi message:', error);
             Alert.alert('Erreur', 'Impossible d\'envoyer le message');
@@ -152,7 +195,7 @@ export default function ChatWithUsersScreen({ navigation }) {
         }
     };
 
-    // Format time (HH:mm)
+    // --- Format time (HH:mm) ---
     const formatTime = (dateString) => {
         const date = new Date(dateString);
         return date.toLocaleTimeString('fr-FR', {
@@ -161,7 +204,7 @@ export default function ChatWithUsersScreen({ navigation }) {
         });
     };
 
-    // Group messages by date with date separators
+    // --- Group messages par date pour affichage ---
     const groupedMessages = useMemo(() => {
         const groups = [];
         let currentDate = '';
@@ -187,12 +230,67 @@ export default function ChatWithUsersScreen({ navigation }) {
         return groups;
     }, [messages]);
 
+    // --- Effets ---
+    useEffect(() => {
+        if (mode === 'new') {
+            loadUsers();
+        } else {
+            loadConversations();
+        }
+    }, [mode, searchQuery]);
+
+    useEffect(() => {
+        if (selectedUser) {
+            loadMessages(selectedUser.id);
+        } else {
+            setMessages([]);
+        }
+    }, [selectedUser]);
+
+    // Realtime messages pour la conversation courante
+    useEffect(() => {
+        if (!selectedUser) return;
+
+        const channel = supabase
+            .channel('conversation_channel')
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'conversation',
+                    filter: `(emetteur=eq.${user.id} AND receveur=eq.${selectedUser.id}) OR (emetteur=eq.${selectedUser.id} AND receveur=eq.${user.id})`
+                },
+                (payload) => {
+                    // Check if the message is not already in the state
+                    if (!messages.some(msg => msg.id === payload.new.id)) {
+                        setMessages((prev) => [...prev, payload.new]);
+                        setTimeout(() => {
+                            flatListRef.current?.scrollToEnd({ animated: true });
+                        }, 100);
+                    }
+                }
+            )
+            .subscribe();
+
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, [selectedUser, user.id, messages]);
+
+    // --- Renders ---
+
+    // Item pour liste utilisateurs (mode "new")
     const renderUserItem = ({ item }) => {
         const isSelected = selectedUser?.id === item.id;
         return (
             <Pressable
                 style={[styles.userItem, isSelected && styles.userItemSelected]}
-                onPress={() => setSelectedUser(item)}
+                onPress={() => {
+                    setSelectedUser(item);
+                    setMode('history'); // Switch to conversation view on selection
+                    setSearchQuery('');
+                }}
             >
                 <Image
                     source={item.photo ? { uri: item.photo } : require('./img.png')}
@@ -204,6 +302,45 @@ export default function ChatWithUsersScreen({ navigation }) {
             </Pressable>
         );
     };
+
+    // Item pour liste conversations (mode "history")
+    const renderConversationItem = ({ item }) => {
+        const otherUser = item.user;
+        const lastMsg = item.lastMessage;
+        const isSelected = selectedUser?.id === otherUser.id;
+
+        if (!otherUser) return null;
+
+        return (
+            <Pressable
+                style={[styles.userItem, isSelected && styles.userItemSelected]}
+                onPress={() => setSelectedUser(otherUser)}
+            >
+                <Image
+                    source={otherUser.photo ? { uri: otherUser.photo } : require('./img.png')}
+                    style={styles.userAvatar}
+                />
+                <View style={{ flex: 1 }}>
+                    <Text style={styles.usernameText} numberOfLines={1}>
+                        {otherUser.nom_complet}
+                    </Text>
+                    <Text
+                        style={styles.lastMessageText}
+                        numberOfLines={1}
+                        ellipsizeMode="tail"
+                    >
+                        {lastMsg.emetteur === user.id ? 'Vous: ' : ''}
+                        {lastMsg.message}
+                    </Text>
+                </View>
+                <Text style={styles.lastMessageTime}>
+                    {formatTime(lastMsg.created_at)}
+                </Text>
+            </Pressable>
+        );
+    };
+
+    // Item pour messages dans la conversation
     const renderMessageItem = ({ item }) => {
         if (item.type === 'date') {
             const dateObj = new Date(item.date);
@@ -266,25 +403,56 @@ export default function ChatWithUsersScreen({ navigation }) {
     return (
         <SafeAreaView style={styles.container}>
             <View style={styles.splitContainer}>
-                {/* Left side: Users list + search */}
+                {/* Left side: Conversations or User search */}
                 <View style={styles.usersContainer}>
+                    <View style={styles.newButtonContainer}>
+                        <Pressable
+                            style={styles.newButton}
+                            onPress={() => {
+                                setSelectedUser(null);
+                                setMode('new');
+                                setSearchQuery('');
+                            }}
+                        >
+                            <MaterialIcons name="add" size={20} color="#007AFF" />
+                            <Text style={styles.newButtonText}>Nouveau</Text>
+                        </Pressable>
+                    </View>
+
                     <TextInput
                         style={styles.searchInput}
-                        placeholder="Rechercher un utilisateur..."
+                        placeholder={mode === 'new' ? "Rechercher un utilisateur..." : "Rechercher dans les conversations..."}
                         placeholderTextColor="#999"
                         value={searchQuery}
                         onChangeText={setSearchQuery}
                     />
-                    {loadingUsers ? (
-                        <ActivityIndicator style={{ marginTop: 20 }} size="large" color="#007AFF" />
+
+                    {mode === 'new' ? (
+                        loadingUsers ? (
+                            <ActivityIndicator style={{ marginTop: 20 }} size="large" color="#007AFF" />
+                        ) : (
+                            <FlatList
+                                data={users}
+                                keyExtractor={(item) => item.id}
+                                renderItem={renderUserItem}
+                                showsVerticalScrollIndicator={false}
+                                contentContainerStyle={{ paddingVertical: 10 }}
+                            />
+                        )
                     ) : (
-                        <FlatList
-                            data={users}
-                            keyExtractor={(item) => item.id}
-                            renderItem={renderUserItem}
-                            showsVerticalScrollIndicator={false}
-                            contentContainerStyle={{ paddingVertical: 10 }}
-                        />
+                        loadingConversations ? (
+                            <ActivityIndicator style={{ marginTop: 20 }} size="large" color="#007AFF" />
+                        ) : (
+                            <FlatList
+                                data={conversations.filter((conv) =>
+                                    conv.user.nom_complet.toLowerCase().includes(searchQuery.toLowerCase())
+                                )}
+                                keyExtractor={(item) => item.user.id}
+                                renderItem={renderConversationItem}
+                                showsVerticalScrollIndicator={false}
+                                contentContainerStyle={{ paddingVertical: 10 }}
+                            />
+                        )
                     )}
                 </View>
 
@@ -311,10 +479,8 @@ export default function ChatWithUsersScreen({ navigation }) {
                                         style={styles.chatUserAvatar}
                                     />
                                     <Text style={styles.chatUsername}>{selectedUser.nom_complet}</Text>
-
-                                    <Text style={styles.chatUsername}>{selectedUser.username}</Text>
                                 </View>
-                                <View style={{ width: 40 }} /> {/* Placeholder for right icons */}
+                                <View style={{ width: 40 }} /> {/* Placeholder */}
                             </View>
 
                             {/* Messages list */}
@@ -371,196 +537,228 @@ export default function ChatWithUsersScreen({ navigation }) {
 const styles = StyleSheet.create({
     container: {
         flex: 1,
-        backgroundColor: '#f8f9fa',
+        backgroundColor: '#fff',
     },
     splitContainer: {
+        flexDirection: 'row',
         flex: 1,
-        flexDirection: width > 600 ? 'row' : 'column', // row for tablets, column for phones
     },
-
-    /* Left panel */
     usersContainer: {
-        width: width > 600 ? 280 : '100%',
-        borderRightWidth: width > 600 ? 1 : 0,
-        borderRightColor: '#e1e8ed',
-        backgroundColor: '#fff',
+        width: width * 0.35,
+        borderRightWidth: 1,
+        borderRightColor: '#ddd',
+        backgroundColor: '#f9f9f9',
+        paddingHorizontal: 10,
+        paddingTop: 10,
+    },
+    newButtonContainer: {
+        marginBottom: 10,
+        flexDirection: 'row',
+        justifyContent: 'flex-start',
+    },
+    newButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 6,
         paddingHorizontal: 12,
-        paddingTop: 12,
+        borderRadius: 20,
+        borderWidth: 1,
+        borderColor: '#007AFF',
+    },
+    newButtonText: {
+        color: '#007AFF',
+        fontWeight: '600',
+        marginLeft: 6,
     },
     searchInput: {
-        height: 40,
-        borderColor: '#e1e8ed',
+        height: 38,
+        borderColor: '#ddd',
         borderWidth: 1,
         borderRadius: 20,
-        paddingHorizontal: 16,
+        paddingHorizontal: 15,
+        backgroundColor: '#fff',
         marginBottom: 10,
-        backgroundColor: '#f8f9fa',
+        fontSize: 14,
     },
     userItem: {
         flexDirection: 'row',
         alignItems: 'center',
         paddingVertical: 8,
         paddingHorizontal: 6,
-        borderRadius: 12,
+        borderRadius: 10,
+        marginBottom: 4,
     },
     userItemSelected: {
-        backgroundColor: '#007AFF22',
+        backgroundColor: '#e6f0ff',
     },
     userAvatar: {
-        width: 36,
-        height: 36,
-        borderRadius: 18,
-        marginRight: 12,
-        backgroundColor: '#ddd',
+        width: 40,
+        height: 40,
+        borderRadius: 20,
+        marginRight: 10,
+        backgroundColor: '#ccc',
     },
     usernameText: {
-        fontSize: 16,
-        color: '#333',
+        fontWeight: '600',
+        fontSize: 14,
         flexShrink: 1,
     },
-
-    /* Right panel */
+    lastMessageText: {
+        color: '#666',
+        fontSize: 13,
+        marginTop: 2,
+    },
+    lastMessageTime: {
+        fontSize: 12,
+        color: '#999',
+        marginLeft: 5,
+    },
     chatContainer: {
         flex: 1,
-        backgroundColor: '#f8f9fa',
+        backgroundColor: '#fff',
         justifyContent: 'flex-start',
     },
     noChatSelected: {
         flex: 1,
         justifyContent: 'center',
         alignItems: 'center',
-        paddingHorizontal: 24,
+        paddingHorizontal: 30,
     },
     noChatText: {
         fontSize: 16,
-        color: '#666',
+        color: '#999',
+        textAlign: 'center',
     },
     chatHeader: {
-        height: 56,
-        backgroundColor: '#fff',
-        borderBottomColor: '#e1e8ed',
+        height: 60,
         borderBottomWidth: 1,
+        borderBottomColor: '#ddd',
         flexDirection: 'row',
         alignItems: 'center',
-        paddingHorizontal: 12,
-        justifyContent: 'space-between',
+        paddingHorizontal: 10,
+        backgroundColor: '#f5f5f5',
     },
     backToUsersButton: {
-        padding: 8,
+        width: 40,
+        justifyContent: 'center',
+        alignItems: 'center',
     },
     chatHeaderUserInfo: {
         flexDirection: 'row',
         alignItems: 'center',
         flex: 1,
-        marginLeft: 8,
+        marginLeft: 5,
     },
     chatUserAvatar: {
-        width: 36,
-        height: 36,
-        borderRadius: 18,
-        backgroundColor: '#ddd',
-        marginRight: 12,
+        width: 40,
+        height: 40,
+        borderRadius: 20,
+        backgroundColor: '#ccc',
+        marginRight: 10,
     },
     chatUsername: {
-        fontSize: 18,
-        fontWeight: '600',
-        color: '#333',
-        flexShrink: 1,
+        fontWeight: '700',
+        fontSize: 16,
     },
     messagesList: {
         flex: 1,
-        paddingHorizontal: 16,
+        paddingHorizontal: 12,
         paddingVertical: 10,
+        backgroundColor: '#fafafa',
     },
     dateContainer: {
         alignItems: 'center',
-        marginVertical: 20,
+        marginVertical: 10,
     },
     dateText: {
-        fontSize: 14,
-        color: '#666',
-        backgroundColor: '#e9ecef',
+        fontSize: 13,
+        color: '#999',
+        fontWeight: '600',
+        backgroundColor: '#e0e0e0',
         paddingHorizontal: 12,
-        paddingVertical: 6,
+        paddingVertical: 4,
         borderRadius: 12,
+        overflow: 'hidden',
     },
     messageContainer: {
-        marginVertical: 2,
+        marginVertical: 4,
+        flexDirection: 'row',
+        maxWidth: '75%',
     },
     myMessageContainer: {
-        alignItems: 'flex-end',
+        alignSelf: 'flex-end',
+        justifyContent: 'flex-end',
     },
     otherMessageContainer: {
-        alignItems: 'flex-start',
+        alignSelf: 'flex-start',
+        justifyContent: 'flex-start',
     },
     messageBubble: {
-        maxWidth: '75%',
-        paddingHorizontal: 16,
-        paddingVertical: 10,
-        borderRadius: 20,
+        borderRadius: 15,
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        shadowColor: '#000',
+        shadowOpacity: 0.05,
+        shadowRadius: 3,
+        shadowOffset: { width: 0, height: 1 },
     },
     myMessageBubble: {
         backgroundColor: '#007AFF',
-        borderBottomRightRadius: 6,
+        borderTopRightRadius: 0,
     },
     otherMessageBubble: {
-        backgroundColor: '#e9ecef',
-        borderBottomLeftRadius: 6,
+        backgroundColor: '#e5e5ea',
+        borderTopLeftRadius: 0,
     },
     messageText: {
-        fontSize: 16,
-        lineHeight: 20,
+        fontSize: 14,
     },
     myMessageText: {
         color: '#fff',
     },
     otherMessageText: {
-        color: '#333',
+        color: '#000',
     },
     timeText: {
-        fontSize: 12,
+        fontSize: 10,
         marginTop: 4,
-        opacity: 0.7,
-    },
-    myTimeText: {
-        color: '#fff',
         textAlign: 'right',
     },
+    myTimeText: {
+        color: '#d0d0d0',
+    },
     otherTimeText: {
-        color: '#666',
-        textAlign: 'left',
+        color: '#888',
     },
     inputContainer: {
         flexDirection: 'row',
         alignItems: 'flex-end',
-        paddingHorizontal: 16,
-        paddingVertical: 12,
-        backgroundColor: '#fff',
+        paddingHorizontal: 10,
+        paddingVertical: 8,
         borderTopWidth: 1,
-        borderTopColor: '#e1e8ed',
+        borderTopColor: '#ddd',
+        backgroundColor: '#fff',
     },
     textInput: {
         flex: 1,
-        borderWidth: 1,
-        borderColor: '#e1e8ed',
-        borderRadius: 20,
-        paddingHorizontal: 16,
-        paddingVertical: 10,
-        fontSize: 16,
         maxHeight: 100,
-        backgroundColor: '#f8f9fa',
-        marginRight: 10,
+        borderWidth: 1,
+        borderColor: '#ddd',
+        borderRadius: 20,
+        paddingHorizontal: 15,
+        paddingVertical: 8,
+        fontSize: 14,
+        color: '#000',
     },
     sendButton: {
+        marginLeft: 10,
         backgroundColor: '#007AFF',
         borderRadius: 20,
         padding: 10,
         justifyContent: 'center',
         alignItems: 'center',
-        minWidth: 40,
-        minHeight: 40,
     },
     sendButtonDisabled: {
-        backgroundColor: '#ccc',
+        backgroundColor: '#a0c4ff',
     },
 });
