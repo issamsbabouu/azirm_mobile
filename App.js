@@ -30,10 +30,8 @@ const fetchConnectionToken = async () => {
         throw error;
     }
 };
-
-// Ce composant s'occupe juste de brancher le thème à la navigation
 function AppInner() {
-    const { isDark } = useTheme(); // lit l'état du thème
+    const { isDark } = useTheme();
 
     return (
         <>

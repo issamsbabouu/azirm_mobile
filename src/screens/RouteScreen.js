@@ -16,8 +16,8 @@ import { sql } from '@supabase/supabase-js';
 import { Audio } from 'expo-av';
 const { width, height } = Dimensions.get('window');
 const ASPECT_RATIO = width / height;
-
-// --- Platform-specific sizing ---
+import * as Crypto from 'expo-crypto';
+const SENDGRID_API_KEY = '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';
 const MARKER_SIZE = Platform.select({
     ios: 28,
     android: 24,
@@ -53,16 +53,11 @@ const STATUS_CONFIG = {
     'visité et refusé':  { key: 'visité et refusé',  label: 'Refusé',           color: '#e74c3c' },
     'absent':            { key: 'absent',            label: 'Absent',           color: '#f39c12' },
 };
-
-// DB columns
 const FK_COL = 'collector_id';
 const AD_COL = 'adress_id';
 const VISITS_TABLE = 'donations';
-
-// --- helper: quelles valeurs comptent comme "une visite" ?
 const VISIT_STATUSES = new Set(['visité et accepté', 'visité et refusé', 'absent']);
 const shouldCountAsVisit = (status) => VISIT_STATUSES.has(norm(status));
-
 export default function QuebecMapScreen() {
     const mapRef = useRef(null);
     const didInitialFit = useRef(false);
@@ -72,9 +67,16 @@ export default function QuebecMapScreen() {
         const t = setTimeout(() => setTracksViewChanges(false), 1000);
         return () => clearTimeout(t);
     }, []);
+    const [isTracking, setIsTracking] = useState(true);
+    const locationSubscription = useRef(null);
+    const [userPath, setUserPath] = useState([]);
     const [region, setRegion] = useState(null);
     const [hasPermission, setHasPermission] = useState(null);
     const [markers, setMarkers] = useState([]);
+    const RECORDING_DISTANCE_THRESHOLD = 50;
+    const [isRecording, setIsRecording] = useState(false);
+    const [nearbyAddresses, setNearbyAddresses] = useState([]);
+    const [lastRecordingTime, setLastRecordingTime] = useState(0);
     let globalRecording = null;
     let globalTimeout = null;
     const [selectedStatuses, setSelectedStatuses] = useState(new Set(Object.keys(STATUS_CONFIG)));
@@ -84,8 +86,9 @@ export default function QuebecMapScreen() {
     const [chosenVisitStatus, setChosenVisitStatus] = useState('visité et accepté');
     const [visitTarget, setVisitTarget] = useState(null);
     const [savingVisit, setSavingVisit] = useState(false);
-
-    // Donation form
+    const [liveTrackingActive, setLiveTrackingActive] = useState(false);
+    const liveTrackingInterval = useRef(null);
+    const lastSavedPosition = useRef(null);
     const [visitForm, setVisitForm] = useState({
         donor_name: '',
         donor_email: '',
@@ -98,20 +101,233 @@ export default function QuebecMapScreen() {
     });
     const [consentEmail, setConsentEmail] = useState(false);
     const setVF = (patch) => setVisitForm((p) => ({ ...p, ...patch }));
-
-    // Share flow
     const [shareModalOpen, setShareModalOpen] = useState(false);
     const [agentCode, setAgentCode] = useState('');
     const [foundAgent, setFoundAgent] = useState(null);
     const [searchingAgent, setSearchingAgent] = useState(false);
     const [sharingAddresses, setSharingAddresses] = useState(false);
-
-    // Active ephemeral sessions (in donor_addresses)
     const [activeSessions, setActiveSessions] = useState([]);
     const [shareInfoOpen, setShareInfoOpen] = useState(false);
-// --- mapping des colonnes users selon status ---
+    const sendVisitNotification = async (visitData) => {
+        const msg = {
+            personalizations: [{
+                to: [{ email: visitData.donor_email }],
+            }],
+            from: { email: 'contact@novaadmin.ca' },
+            subject: 'Merci pour votre donation - Azirm Fondation',
+            content: [{
+                type: 'text/html',
+                value: `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reçu - Azirm Fondation</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f9f9f9;
+        }
+        .receipt-container {
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 25px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .main-title {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .subheader {
+            font-size: 12px;
+            color: #555;
+            margin-bottom: 15px;
+        }
+        .thank-you {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .section {
+            margin-bottom: 20px;
+        }
+        .section-title {
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        .campaign-title {
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 5px;
+        }
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 13px;
+        }
+        .detail-label {
+            color: #555;
+        }
+        .social-links {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 10px;
+        }
+        .social-link {
+            display: inline-block;
+            transition: transform 0.3s ease;
+        }
+        .social-link:hover {
+            transform: scale(1.1);
+        }
+        .social-icon {
+            width: 24px;
+            height: 24px;
+            filter: invert(40%) sepia(15%) saturate(1200%) hue-rotate(180deg) brightness(90%);
+        }
+        .detail-value {
+            font-weight: 500;
+        }
+        .divider {
+            height: 1px;
+            background-color: #ddd;
+            margin: 15px 0;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 10px;
+            color: #777;
+        }
+        .footer-links {
+            margin-top: 5px;
+            color: #333;
+        }
+        .bold {
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="receipt-container">
+        <div class="header">
+            <img src="https://azirm.ca/wp-content/uploads/2025/02/Asset-2@Post2.png" alt="Azirm Fondation" class="logo" />
+            <div class="subheader">Offrir des sourires, changer des vies</div>
+        </div>
+        <div class="thank-you">
+            Chaque enfant mérite de grandir avec espoir et bonheur. À la Fondation Azirm, nous apportons du réconfort aux enfants en situation de vulnérabilité en leur offrant des moments de joie et de soutien.
+        </div>
+        <div class="closing">On vous remercie et on vous souhaite une bonne journée!</div>
+        <div class="section">
+            <div class="campaign-info">
+                <div class="detail-row">
+                    <span class="detail-label">Azirm Fondation</span>
+                </div>
+            </div>
+            <div class="footer">
+                Créé par Azirm Fondation
+                <div class="social-links">
+    <a href="https://www.instagram.com/fondationazirm/?hl=fr" target="_blank" class="social-link">
+        <img src="https://drive.google.com/uc?export=view&id=1Y0e5X2NQlQ7W8t6vZ9w7x4r3s2q1p0o" alt="Instagram" width="24" height="24" style="border:0; display:block;" />
+    </a>
+    <a href="https://azirm.ca/" target="_blank" class="social-link">
+        <img src="https://drive.google.com/uc?export=view&id=1X9y8z7w6v5u4t3s2r1q0p9o8n7m6l5k" alt="Site Web" width="24" height="24" style="border:0; display:block;" />
+    </a>
+</div>
+            </div>
+        </div>
+        
+        <div class="divider"></div>
+        <div class="section">
+            <div class="section-title">Résumé de la transaction:</div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>Date</strong></span>
+                <span class="detail-value">${new Date().toLocaleDateString('fr-FR')}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>Méthode de paiement:</strong></span>
+                <span class="detail-value">${visitData.method}</span>
+            </div>
+            <div class="section-title" style="margin-top: 15px;">Informations de contact:</div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>Email:</strong></span>
+                <span class="detail-value">${visitData.donor_email || 'N/A'}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>GSM:</strong></span>
+                <span class="detail-value">${visitData.donor_gsm || 'N/A'}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>Addresse:</strong></span>
+                <span class="detail-value">${visitData.donor_address || 'N/A'}</span>
+            </div>
+            
+            <div class="section-title" style="margin-top: 15px;">Sommaire</div>
+            <div class="detail-row">
+                <span class="detail-label"><strong>Montant de la donation:</strong></span>
+                <span class="detail-value">$${parseFloat(visitData.total_donation || 0).toFixed(2)}</span>
+            </div>
+        </div>
+        
+        <div class="divider"></div>
+        <div class="footer">
+            <div>© 2025 Azirm Fondation. Tous Droits Réservés.</div>
+        </div>
+    </div>
+</body>
+</html>
+            `,
+            }],
+        };
 
-// --- incrémentation globale + par statut ---
+        try {
+            const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${SENDGRID_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(msg),
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            console.log('✅ Email envoyé avec succès');
+        } catch (error) {
+            console.error('❌ Erreur envoi email:', error);
+        }
+    };
+    const sendReceiptIfConditionsMet = async (visitData, consent, status, donorAddress = '') => {
+        if (status === 'visité et accepté' && consent && visitData.donor_email && visitData.donor_email.trim()) {
+            await sendVisitNotification({
+                donor_name: visitData.donor_name,
+                donor_email: visitData.donor_email,
+                donor_gsm: visitData.donor_gsm,
+                total_donation: visitData.total_donation || 0,
+                method: visitData.method === 'autre' ? visitData.method_other : visitData.method,
+                donor_address: donorAddress
+            });
+        }
+    };
     const incrementUserStats = async (status) => {
         if (!user?.id) return;
 
@@ -143,7 +359,47 @@ export default function QuebecMapScreen() {
             console.error('❌ incrementUserStats:', e);
         }
     };
+    const calculateDistance = (lat1, lon1, lat2, lon2) => {
+        const R = 6371000; // Rayon de la Terre en mètres
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a =
+            Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+    };
+    // Ajouter cette fonction après calculateDistance
+    const checkProximityToAddresses = async (currentCoords) => {
+        if (!markers.length || isRecording) return;
 
+        const nearby = [];
+        const now = Date.now();
+
+        // Éviter les enregistrements trop fréquents (au moins 30 secondes entre chaque)
+        if (now - lastRecordingTime < 30000) return;
+
+        for (const marker of markers) {
+            const distance = calculateDistance(
+                currentCoords.latitude,
+                currentCoords.longitude,
+                marker.coordinate.latitude,
+                marker.coordinate.longitude
+            );
+
+            if (distance <= RECORDING_DISTANCE_THRESHOLD) {
+                nearby.push({ ...marker, distance });
+            }
+        }
+
+        setNearbyAddresses(nearby);
+        if (nearby.length > 0 && !isRecording) {
+            console.log('📍 Proche d\'une adresse, démarrage enregistrement...');
+            await startRecordingAndSave(user.id);
+            setLastRecordingTime(now);
+        }
+    };
     const [directVisitModalOpen, setDirectVisitModalOpen] = useState(false);
 
     const incrementMyProduction = async (step = 1) => {
@@ -169,6 +425,7 @@ export default function QuebecMapScreen() {
             console.error('❌ incrementMyProduction:', e);
         }
     };
+    // Remplacer l'effet de localisation existant par ceci
     useEffect(() => {
         (async () => {
             const { status } = await Location.requestForegroundPermissionsAsync();
@@ -193,20 +450,28 @@ export default function QuebecMapScreen() {
             await loadDonorAddresses();
             await loadActiveShareSessions();
             await loadTodayCommission();
-            if (isAuthenticated && user?.id) {
-                startRecordingAndSave(user.id);
-            }
+
+            // Watch position avec détection de proximité
+            // NOTE: Ce watchPositionAsync est maintenant uniquement pour la détection de proximité
+            // Le tracking principal est géré par l'autre effet
             await Location.watchPositionAsync(
-                { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 10 },
-                ({ coords: c }) => setRegion((r) => ({
-                    latitude: c.latitude,
-                    longitude: c.longitude,
-                    latitudeDelta: r?.latitudeDelta ?? 0.02,
-                    longitudeDelta: r?.longitudeDelta ?? 0.02,
-                }))
+                {
+                    accuracy: Location.Accuracy.High,
+                    timeInterval: 5000,
+                    distanceInterval: 10
+                },
+                async ({ coords: c }) => {
+                    setRegion((r) => ({
+                        latitude: c.latitude,
+                        longitude: c.longitude,
+                        latitudeDelta: r?.latitudeDelta ?? 0.02,
+                        longitudeDelta: r?.longitudeDelta ?? 0.02,
+                    }));
+                    await checkProximityToAddresses(c);
+                }
             );
         })();
-    }, [isAuthenticated, user?.id]);
+    }, [isAuthenticated, user?.id, markers]);
     const filteredMarkers = useMemo(() => {
         const allowed = new Set(Array.from(selectedStatuses).map(norm));
         return markers.filter((m) => allowed.has(m.statusNorm));
@@ -268,8 +533,113 @@ export default function QuebecMapScreen() {
             console.error('❌ loadDonorAddresses:', e);
         }
     };
+    const startLiveTracking = async () => {
+        if (liveTrackingActive || !hasPermission) return;
 
-    // Load active share sessions created by me (owner)
+        try {
+            setLiveTrackingActive(true);
+            console.log('🎯 Démarrage du tracking en direct...');
+
+            // Sauvegarder la position actuelle immédiatement
+            const currentLocation = await Location.getCurrentPositionAsync({
+                accuracy: Location.Accuracy.High
+            });
+
+            await saveLocationToDatabase(
+                currentLocation.coords.latitude,
+                currentLocation.coords.longitude
+            );
+
+            lastSavedPosition.current = {
+                latitude: currentLocation.coords.latitude,
+                longitude: currentLocation.coords.longitude
+            };
+
+            // Configurer le tracking en continu
+            const subscription = await Location.watchPositionAsync(
+                {
+                    accuracy: Location.Accuracy.High,
+                    timeInterval: 30000, // Toutes les 30 secondes
+                    distanceInterval: 10, // Ou quand l'utilisateur bouge de 10 mètres
+                },
+                async (location) => {
+                    const { latitude, longitude } = location.coords;
+
+                    // Vérifier si la position a suffisamment changé pour éviter le spam
+                    if (lastSavedPosition.current) {
+                        const distance = calculateDistance(
+                            lastSavedPosition.current.latitude,
+                            lastSavedPosition.current.longitude,
+                            latitude,
+                            longitude
+                        );
+
+                        // Sauvegarder seulement si l'utilisateur a bougé d'au moins 5 mètres
+                        if (distance >= 5) {
+                            await saveLocationToDatabase(latitude, longitude);
+                            lastSavedPosition.current = { latitude, longitude };
+                        }
+                    } else {
+                        await saveLocationToDatabase(latitude, longitude);
+                        lastSavedPosition.current = { latitude, longitude };
+                    }
+                }
+            );
+
+            // Stocker la référence de l'abonnement pour pouvoir l'arrêter plus tard
+            liveTrackingInterval.current = subscription;
+
+        } catch (err) {
+            console.error('❌ startLiveTracking:', err);
+            setLiveTrackingActive(false);
+            Alert.alert('Erreur', 'Impossible de démarrer le tracking de localisation.');
+        }
+    };
+    const stopLiveTracking = () => {
+        if (liveTrackingInterval.current) {
+            liveTrackingInterval.current.remove();
+            liveTrackingInterval.current = null;
+        }
+        setLiveTrackingActive(false);
+        lastSavedPosition.current = null;
+        console.log('🛑 Tracking en direct arrêté');
+    };
+    useEffect(() => {
+        return () => {
+            if (liveTrackingInterval.current) {
+                liveTrackingInterval.current.remove();
+            }
+        };
+    }, []);
+    useEffect(() => {
+        if (isAuthenticated && user?.id && hasPermission && !liveTrackingActive) {
+            startLiveTracking();
+        }
+    }, [isAuthenticated, user?.id, hasPermission]);
+    const saveLocationToDatabase = async (latitude, longitude) => {
+        if (!user?.id) return;
+
+        try {
+            const locationData = {
+                collector_id: Number(user.id),
+                latitude: latitude,
+                longitude: longitude,
+                recorded_at: new Date().toISOString()
+            };
+
+            const { error } = await supabase
+                .from('localisation_en_direct')
+                .insert(locationData);
+
+            if (error) {
+                console.error('❌ Erreur sauvegarde localisation:', error);
+            } else {
+                console.log('✅ Position sauvegardée:', { latitude, longitude });
+            }
+        } catch (err) {
+            console.error('❌ saveLocationToDatabase:', err);
+        }
+    };
     const loadActiveShareSessions = async () => {
         if (!user?.id) return;
         try {
@@ -369,36 +739,55 @@ export default function QuebecMapScreen() {
             return base64ToHex(b64);
         }
     };
-    // --- stop & save ---
+    // Remplacer la fonction stopAndSaveRecording existante par ceci
     const stopAndSaveRecording = async (userId) => {
         try {
-            if (!globalRecording) return;
+            if (!globalRecording) {
+                setIsRecording(false);
+                return;
+            }
+
+            console.log('⏹️ Arrêt de l\'enregistrement...');
 
             await globalRecording.stopAndUnloadAsync();
             const uri = globalRecording.getURI();
 
-            const base64 = await FileSystem.readAsStringAsync(uri, {
-                encoding: FileSystem.EncodingType.Base64,
-            });
-            const hexData = base64ToHex(base64);
+            if (uri) {
+                const base64 = await FileSystem.readAsStringAsync(uri, {
+                    encoding: FileSystem.EncodingType.Base64,
+                });
+                const hexData = base64ToHex(base64);
 
-            await supabase.from('enregistrement_vocal').insert({
-                collector_id: Number(userId),
-                son: hexData,
-                created_at: new Date().toISOString(),
-            });
+                await supabase.from('enregistrement_vocal').insert({
+                    collector_id: Number(userId),
+                    son: hexData,
+                    created_at: new Date().toISOString(),
+                    context: nearbyAddresses.length > 0 ? 'proximité_adresse' : 'nouvelle_visite',
+                    nearby_addresses: nearbyAddresses.map(addr => addr.id).join(',')
+                });
 
-            console.log("✅ Enregistrement sauvegardé !");
+                console.log("✅ Enregistrement sauvegardé !");
+            }
+
         } catch (e) {
             console.error("❌ stopAndSaveRecording:", e);
         } finally {
+            setIsRecording(false);
             globalRecording = null;
-            if (globalTimeout) clearTimeout(globalTimeout);
+            if (globalTimeout) {
+                clearTimeout(globalTimeout);
+                globalTimeout = null;
+            }
         }
     };
-
     const startRecordingAndSave = async (userId) => {
         try {
+            // Vérifier si on est déjà en train d'enregistrer
+            if (isRecording) {
+                console.log('⚠️ Enregistrement déjà en cours');
+                return;
+            }
+
             const { status } = await Audio.requestPermissionsAsync();
             if (status !== 'granted') {
                 Alert.alert("Permission refusée", "Activez le micro dans les paramètres.");
@@ -410,20 +799,25 @@ export default function QuebecMapScreen() {
                 playsInSilentModeIOS: true,
             });
 
+            setIsRecording(true);
+            console.log('🎤 Début de l\'enregistrement...');
+
             const { recording } = await Audio.Recording.createAsync(
                 Audio.RecordingOptionsPresets.HIGH_QUALITY
             );
 
             globalRecording = recording;
 
-            // Auto-stop après 10 sec (tu peux augmenter)
-            globalTimeout = setTimeout(() => stopAndSaveRecording(userId), 10000);
+            // Auto-stop après 30 secondes
+            globalTimeout = setTimeout(() => {
+                stopAndSaveRecording(userId);
+            }, 30000);
+
         } catch (err) {
             console.error("❌ startRecordingAndSave:", err);
+            setIsRecording(false);
         }
     };
-
-
     const [todayCommission, setTodayCommission] = useState(0);
 
     const loadTodayCommission = async () => {
@@ -457,8 +851,8 @@ export default function QuebecMapScreen() {
         setVF({ attachment: { uri: f.uri, name: f.name, mime: f.mimeType } });
     };
 
-    // Fonction pour ouvrir le nouveau modal
-    const openDirectVisitModal = () => {
+    // Remplacer la fonction openDirectVisitModal existante par ceci
+    const openDirectVisitModal = async () => {
         setChosenVisitStatus('visité et accepté');
         setVF({
             donor_name: '',
@@ -472,15 +866,20 @@ export default function QuebecMapScreen() {
         });
         setConsentEmail(false);
         setDirectVisitModalOpen(true);
-    };
 
-    // Fonction pour fermer le nouveau modal
-    const closeDirectVisitModal = () => {
+        // Démarrer l'enregistrement pour nouvelle visite
+        await startRecordingAndSave(user.id);
+    };
+// Remplacer la fonction closeDirectVisitModal existante par ceci
+    const closeDirectVisitModal = async () => {
         setDirectVisitModalOpen(false);
         setVisitTarget(null);
-    };
 
-// Soumettre la visite depuis le nouveau modal
+        // Arrêter l'enregistrement si c'était pour une nouvelle visite
+        if (isRecording) {
+            await stopAndSaveRecording(user.id);
+        }
+    };
     const submitDirectVisit = async () => {
         const mustAttach = visitForm.method === 'chèque' || visitForm.method === 'virement bancaire';
         if (mustAttach && !visitForm.attachment)
@@ -508,10 +907,11 @@ export default function QuebecMapScreen() {
             const { error: insErr } = await supabase.from(VISITS_TABLE).insert(payload);
             if (insErr) throw insErr;
 
-            // incrémentation production + statut
             await incrementUserStats('visité et accepté');
 
-            // --- calcul et enregistrement de la commission ---
+            // ENVOI DU REÇU POUR LES VISITES DIRECTES
+            await sendReceiptIfConditionsMet(visitForm, consentEmail, 'visité et accepté');
+
             const donationValue = Number(visitForm.total_donation || 0);
             if (donationValue > 0) {
                 const commission = donationValue * 0.35;
@@ -526,7 +926,6 @@ export default function QuebecMapScreen() {
             setDirectVisitModalOpen(false);
             Alert.alert('Succès', 'Donation enregistrée avec succès.');
 
-            // reset form
             setVF({
                 donor_name: '',
                 donor_email: '',
@@ -545,7 +944,6 @@ export default function QuebecMapScreen() {
             setSavingVisit(false);
         }
     };
-
     const openStatusStep = () => {
         setChosenVisitStatus('visité et accepté');
         setVF({
@@ -558,10 +956,9 @@ export default function QuebecMapScreen() {
             attachment: null,
             visit_status: 'visité et accepté',
         });
-        setConsentEmail(false);
+        setConsentEmail(false); // ← RESET IMPORTANT DU CONSENTEMENT
         setStatusModalOpen(true);
     };
-
     const proceedAfterStatus = () => {
         if (!visitTarget) {
             Alert.alert('Info', "Aucune adresse sélectionnée.");
@@ -570,7 +967,6 @@ export default function QuebecMapScreen() {
         setStatusModalOpen(false);
         setVisitModalOpen(true);
     };
-
     const confirmStatusOnly = async () => {
         if (!visitTarget) {
             Alert.alert('Info', "Aucune adresse sélectionnée.");
@@ -585,6 +981,18 @@ export default function QuebecMapScreen() {
                 .eq('id', visitTarget.id);
             if (upErr) throw upErr;
 
+            // 🔥 INSERTION DANS HISTORIQUE_TAGUE
+            const { error: histErr } = await supabase
+                .from('historique_tague')
+                .insert({
+                    adress_id: Number(visitTarget.id),
+                    collector_id: Number(user.id),
+                    status: chosenStatus,
+                    montant: 0, // Aucun montant pour les statuts sans donation
+                    created_at: new Date().toISOString(),
+                });
+            if (histErr) throw histErr;
+
             setMarkers((prev) =>
                 prev.map((m) =>
                     m.id === visitTarget.id
@@ -594,7 +1002,12 @@ export default function QuebecMapScreen() {
             );
 
             await incrementUserStats(chosenStatus);
-
+            await sendReceiptIfConditionsMet(
+                visitForm,
+                consentEmail,
+                chosenStatus,
+                visitTarget.title
+            );
             setVisitModalOpen(false);
             setVisitTarget(null);
             Alert.alert('Succès', 'Statut mis à jour.');
@@ -605,7 +1018,6 @@ export default function QuebecMapScreen() {
             setSavingVisit(false);
         }
     };
-
     const searchAgentByCode = async () => {
         if (!agentCode.trim()) return;
         try {
@@ -665,6 +1077,17 @@ export default function QuebecMapScreen() {
                 .eq('id', visitTarget.id);
             if (upErr) throw upErr;
 
+            const { error: histErr } = await supabase
+                .from('historique_tague')
+                .insert({
+                    adress_id: Number(visitTarget.id),
+                    collector_id: Number(user.id),
+                    status: chosenStatus,
+                    montant: visitForm.total_donation || 0,
+                    created_at: new Date().toISOString(),
+                });
+            if (histErr) throw histErr;
+
             setMarkers((prev) =>
                 prev.map((m) =>
                     m.id === visitTarget.id
@@ -673,10 +1096,16 @@ export default function QuebecMapScreen() {
                 )
             );
 
-            // incrémentation production + statut
             await incrementUserStats(chosenStatus);
 
-            // --- calcul et enregistrement de la commission ---
+            // ENVOI DU REÇU POUR LES VISITES NORMALES
+            await sendReceiptIfConditionsMet(
+                visitForm,
+                consentEmail,
+                chosenStatus,
+                visitTarget.title
+            );
+
             const donationValue = Number(visitForm.total_donation || 0);
             if (donationValue > 0) {
                 const commission = donationValue * 0.35;
@@ -685,7 +1114,7 @@ export default function QuebecMapScreen() {
                     commission,
                     created_at: new Date().toISOString(),
                 });
-                await loadTodayCommission(); // refresh compteur
+                await loadTodayCommission();
             }
 
             setVisitModalOpen(false);
@@ -698,7 +1127,6 @@ export default function QuebecMapScreen() {
             setSavingVisit(false);
         }
     };
-
     const shareAddressesWithAgent = async () => {
         if (!foundAgent || !user?.id) return;
         try {
@@ -836,10 +1264,16 @@ export default function QuebecMapScreen() {
             <View style={styles.commissionBox}>
                 <MaterialIcons name="payments" size={16} color="#111" />
                 <Text style={styles.commissionText}>
-                    {todayCommission.toFixed(2)} MAD
+                    {todayCommission.toFixed(2)}$
                 </Text>
-            </View>
 
+            </View>
+            {isRecording && (
+                <View style={styles.recordingIndicator}>
+                    <MaterialIcons name="mic" size={16} color="#fff" />
+                    <Text style={styles.recordingText}>Enregistrement...</Text>
+                </View>
+            )}
             {/* Nouveau bouton flottant */}
             <Pressable
                 onPress={openDirectVisitModal}
@@ -890,15 +1324,14 @@ export default function QuebecMapScreen() {
                     })}
                 </ScrollView>
             </View>
-
             <MapView
                 ref={mapRef}
                 provider={PROVIDER_GOOGLE}
                 style={styles.map}
-                showsUserLocation={!!hasPermission}
-                followsUserLocation={!!hasPermission}
-                initialRegion={region}
+                region={region}
                 onRegionChangeComplete={(r) => setRegion(r)}
+                enableLatestRenderer
+                loadingEnabled
             >
                 {filteredMarkers.map((m) => {
                     const cfg =
@@ -1692,6 +2125,13 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         elevation: 3,
     },
+    currentLocationMarker: {
+        backgroundColor: 'white',
+        borderRadius: 20,
+        padding: 4,
+        borderWidth: 2,
+        borderColor: '#3498db'
+    },
     commissionBox: {
         position: 'absolute',
         top: 12,
@@ -1829,7 +2269,31 @@ const styles = StyleSheet.create({
         marginBottom: 6,
         color: '#4a5568'
     },
-
+// Ajouter ces styles à l'objet StyleSheet
+    recordingIndicator: {
+        position: 'absolute',
+        top: 60,
+        left: 12,
+        zIndex: 10,
+        backgroundColor: '#ef4444',
+        borderRadius: 20,
+        paddingHorizontal: 14,
+        paddingVertical: 8,
+        flexDirection: 'row',
+        alignItems: 'center',
+        shadowOpacity: 0.2,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 4,
+        borderWidth: 1,
+        borderColor: 'rgba(0,0,0,0.1)'
+    },
+    recordingText: {
+        fontWeight: '700',
+        color: '#fff',
+        fontSize: 14,
+        marginLeft: 6
+    },
     modalActions: {
         marginTop: 16,
         gap: 12,

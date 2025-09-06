@@ -1,4 +1,5 @@
 <resources>
   <string name="app_name">AZIRM Collector</string>
   <string name="expo_system_ui_user_interface_style" translatable="false">light</string>
+  <string name="google_maps_api_key">AIzaSyAGEIY30TarwYp4JqO9gDxKzD4Duqkpx18</string>
 </resources>

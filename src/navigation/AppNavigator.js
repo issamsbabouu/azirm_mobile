@@ -9,15 +9,14 @@ import RouteScreen from '../screens/RouteScreen';
 import DashboardScreen from '../screens/DashboardScreen';
 import WalletScreen from "../screens/WalletScreen";
 import EditProfileScreen from "../screens/EditProfilScreen";
+import ChatScreen from "../screens/ChatScreen";
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
-
 const AuthNavigator = () => (
     <Stack.Navigator screenOptions={{ headerShown: false }}>
         <Stack.Screen name="Auth" component={LoginScreen} />
     </Stack.Navigator>
 );
-
 const MainTabs = () => (
     <Tab.Navigator
         screenOptions={{ headerShown: false, tabBarActiveTintColor: '#0059E4', tabBarInactiveTintColor: '#8E8E93' }}
@@ -41,6 +40,10 @@ const MainTabs = () => (
             name="Route"
             component={RouteScreen}
             options={{ tabBarIcon: ({ color }) => <MaterialIcons name="map" size={24} color={color} /> }}
+        /><Tab.Screen
+            name="Chat"
+            component={ChatScreen}
+            options={{ tabBarIcon: ({ color }) => <MaterialIcons name="chat" size={24} color={color} /> }}
         />
         <Tab.Screen
             name="EditProfil"
@@ -49,7 +52,6 @@ const MainTabs = () => (
         />
     </Tab.Navigator>
 );
-
 const AppNavigator = () => {
     const { isAuthenticated } = useAuth();
 

@@ -17,6 +17,4 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
         detectSessionInUrl: false,
     },
 });
-
-// Log pour vérifier la configuration lors du démarrage (à retirer en prod)
 console.log('✅ Supabase initialisé avec URL :', supabaseUrl);

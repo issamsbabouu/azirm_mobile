@@ -14,14 +14,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { supabase } from '../supabase';
-
 const rankColorsLight = ['#2ecc71', '#f39c12', '#3498db', '#8e44ad', '#2980b9'];
 const rankColorsDark  = ['#27ae60', '#e1b12c', '#2980b9', '#8e44ad', '#1f7ab5'];
-
 const currency = (n) =>
     new Intl.NumberFormat('fr-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 2 }).format(n ?? 0);
-
-/* -------------------- UI subcomponents -------------------- */
 const Avatar = ({ uri, size = 32, ringColor = '#2ecc71' }) => (
     <View
         style={{
@@ -42,7 +38,6 @@ const Avatar = ({ uri, size = 32, ringColor = '#2ecc71' }) => (
         />
     </View>
 );
-
 const SpotlightRow = ({ index = 1, item, type = 'money', theme, rankColors }) => {
     const s = createStyles(theme);
     return (
@@ -70,7 +65,6 @@ const SpotlightRow = ({ index = 1, item, type = 'money', theme, rankColors }) =>
         </View>
     );
 };
-
 const RankRow = ({ index, item, max, type = 'money', theme, rankColors }) => {
     const s = createStyles(theme);
     const percent = Math.min(1, (item.value ?? 0) / Math.max(1, max ?? 1));
@@ -223,43 +217,62 @@ export default function DashboardScreen() {
             };
         });
     }, []);
-
+    const refreshLeaderboards = useCallback(async () => {
+        try {
+            setLoading(true);
+            const now = new Date();
+            const dayFrom = new Date(now);
+            dayFrom.setHours(0,0,0,0);
+            const dayTo = new Date(now);
+            dayTo.setHours(23,59,59,999);
+            const topDayData = await fetchTopByAmount(dayFrom, dayTo, 5);
+            const weekNow = new Date();
+            const diff = (weekNow.getDay() + 6) % 7;
+            const weekFrom = new Date(weekNow);
+            weekFrom.setDate(weekFrom.getDate() - diff);
+            weekFrom.setHours(0,0,0,0);
+            const topWeekData = await fetchTopByAmount(weekFrom, new Date(), 5);
+            setTopDay(topDayData);
+            setTopWeek(topWeekData);
+            setTopTime([]);
+            setTopDoors([]);
+        } catch (e) {
+            console.log('[Dashboard refreshLeaderboards] error:', e);
+            setTopDay([]); setTopWeek([]); setTopTime([]); setTopDoors([]);
+        } finally {
+            setLoading(false);
+        }
+    }, [fetchTopByAmount, setLoading]);
     useEffect(() => {
         let cancelled = false;
+        let debounceTimer = null;
+
         (async () => {
-            try {
-                setLoading(true);
-                const d = new Date();
-                const dayFrom = new Date(d.setHours(0,0,0,0));
-                const dayTo = new Date(d.setHours(23,59,59,999));
-                const topDayData = await fetchTopByAmount(dayFrom, dayTo, 5);
-
-                const week = new Date();
-                const diff = (week.getDay() + 6) % 7;
-                const weekFrom = new Date(week.setDate(week.getDate() - diff));
-                weekFrom.setHours(0,0,0,0);
-                const topWeekData = await fetchTopByAmount(weekFrom, new Date(), 5);
-
-                if (!cancelled) {
-                    setTopDay(topDayData);
-                    setTopWeek(topWeekData);
-                    setTopTime([]);
-                    setTopDoors([]);
-                }
-            } catch (e) {
-                console.log('[Dashboard leaderboards] error:', e);
-                if (!cancelled) {
-                    setTopDay([]);
-                    setTopWeek([]);
-                    setTopTime([]);
-                    setTopDoors([]);
-                }
-            } finally {
-                if (!cancelled) setLoading(false);
-            }
+            if (cancelled) return;
+            await refreshLeaderboards();
         })();
-        return () => { cancelled = true; };
-    }, [fetchTopByAmount]);
+
+        const channel = supabase
+            .channel('donations-top-refetch')
+            .on(
+                'postgres_changes',
+                { event: '*', schema: 'public', table: 'donations' },
+                (payload) => {
+                    if (cancelled) return;
+                    if (debounceTimer) clearTimeout(debounceTimer);
+                    debounceTimer = setTimeout(() => {
+                        refreshLeaderboards();
+                    }, 300);
+                }
+            )
+            .subscribe();
+
+        return () => {
+            cancelled = true;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            supabase.removeChannel(channel);
+        };
+    }, [refreshLeaderboards]);
 
     if (loading) {
         return (
@@ -271,7 +284,7 @@ export default function DashboardScreen() {
 
     return (
         <SafeAreaView style={s.container}>
-            {/* -------- Header -------- */}
+            {}
             <View style={s.header}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
                     <View style={[s.headerAvatarRing, { borderColor: theme.colors.accent }]}>
@@ -299,7 +312,7 @@ export default function DashboardScreen() {
                             <Ionicons name="sync" size={18} color={theme.colors.textSecondary} />
                         </View>
                     </TouchableOpacity>
-                    {/* --- Bouton déconnexion --- */}
+                    {}
                     <TouchableOpacity onPress={confirmLogout} activeOpacity={0.8}>
                         <View style={[s.headerIconBtn, { borderColor: "#F43F5E" }]}>
                             <Ionicons name="log-out-outline" size={20} color="#F43F5E" />
@@ -307,8 +320,7 @@ export default function DashboardScreen() {
                     </TouchableOpacity>
                 </View>
             </View>
-
-            {/* -------- Contenu leaderboard -------- */}
+            {}
             <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
                 <View style={s.row}>
                     <View style={s.col}>
